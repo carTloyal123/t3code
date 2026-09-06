@@ -132,6 +132,17 @@ public struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint("Shows provider usage")
+                settingsDivider
+                NavigationLink {
+                    HistoryStorageView(client: model.client)
+                } label: {
+                    SettingsNavigationRow(
+                        title: "History",
+                        systemImage: "internaldrive"
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Shows stored conversation history")
             }
         }
     }

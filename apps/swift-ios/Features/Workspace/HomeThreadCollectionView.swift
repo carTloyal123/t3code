@@ -17,6 +17,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let isArchiveExpanded: Bool
     let settledLimit: Int
     let onOpen: (String) -> Void
+    /// Reported once per thread as its row first scrolls into view, so the
+    /// threads a reader can actually see are the ones brought up to date.
+    let onThreadBecameVisible: (String) -> Void
     let onToggleSnoozed: () -> Void
     let onToggleSettled: () -> Void
     let onToggleArchive: () -> Void
@@ -213,6 +216,18 @@ struct HomeThreadCollectionView: UIViewRepresentable {
         func cancelPendingSwipeActions() {
             pendingSwipeCompletions.values.forEach { $0.finish(false) }
             pendingSwipeCompletions.removeAll()
+        }
+
+        private var reportedVisibleThreadIDs: Set<String> = []
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            willDisplay cell: UICollectionViewCell,
+            forItemAt indexPath: IndexPath
+        ) {
+            guard let threadID = dataSource?.itemIdentifier(for: indexPath)?.threadID,
+                  reportedVisibleThreadIDs.insert(threadID).inserted else { return }
+            parent.onThreadBecameVisible(threadID)
         }
 
         func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {

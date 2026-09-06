@@ -2735,6 +2735,195 @@ private func textInputText(_ view: UIView?) -> String? {
     return nil
 }
 
+extension FeatureRootModelTests {
+    /// Selection owns thread loading. Re-selecting what is already selected must
+    /// not reload it, and must not release the subscription it is using.
+    @Test
+    @MainActor
+    func reselectingTheSameThreadNeitherReloadsNorReleasesIt() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "One")
+        client.threadDetail = FeatureThreadDetail(thread: thread)
+        let model = testRootModel(client: client)
+        model.selectThread("thread-1")
+        await settle(model)
+        let loadsAfterFirstSelection = client.loadThreadCallCount
+
+        model.selectThread("thread-1")
+        await settle(model)
+
+        #expect(client.loadThreadCallCount == loadsAfterFirstSelection)
+        #expect(client.releasedThreadIDs.isEmpty)
+    }
+
+    /// Only the thread being left is released. Releasing the incoming one would
+    /// tear down the subscription it just established.
+    @Test
+    @MainActor
+    func selectionChangesReleaseOnlyThePreviouslySelectedThread() async {
+        let client = FeatureClientStub()
+        client.threadDetail = FeatureThreadDetail(
+            thread: FeatureThread(id: "thread-1", projectID: "project-1", title: "One")
+        )
+        let model = testRootModel(client: client)
+        model.selectThread("thread-1")
+        await settle(model)
+
+        model.selectThread("thread-2")
+        await settle(model)
+
+        #expect(client.releasedThreadIDs == ["thread-1"])
+    }
+
+    /// The transcript renders a bounded window while the reader is at the newest
+    /// message. Compositional layout recomputes the whole section per update, so
+    /// an unbounded transcript makes every streamed token cost more than a frame.
+    @Test
+    @MainActor
+    func theLiveWindowStaysBoundedWhileReadingTheNewestMessage() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Long")
+        client.threadDetail = FeatureThreadDetail(
+            thread: thread,
+            messages: (1 ... 200).map {
+                FeatureMessage(id: "m\($0)", role: .assistant, text: "text \($0)")
+            }
+        )
+        let model = testRootModel(client: client)
+
+        _ = await model.detail(for: "thread-1", force: true)
+
+        let rendered = model.details["thread-1"]?.messages ?? []
+        #expect(rendered.count == 60)
+        #expect(rendered.last?.id == "m200")
+    }
+
+    /// The streaming path writes `details` separately from the full path. It
+    /// used to skip the window entirely, so a streamed delta re-expanded what
+    /// the full path had just trimmed and the two fought each other.
+    @Test
+    @MainActor
+    func streamedUpdatesRespectTheWindowToo() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Long")
+        let history = (1 ... 200).map {
+            FeatureMessage(id: "m\($0)", role: .assistant, text: "text \($0)")
+        }
+        client.threadDetail = FeatureThreadDetail(thread: thread, messages: history)
+        let model = testRootModel(client: client)
+        _ = await model.detail(for: "thread-1", force: true)
+
+        // The client publishes the whole transcript alongside a delta.
+        client.emit(
+            .detailDelta(
+                FeatureThreadDetail(thread: thread, messages: history),
+                FeatureDetailDelta(changedMessages: [], appendedMessageIDs: [])
+            )
+        )
+        for _ in 0 ..< 6 { await Task.yield() }
+
+        #expect(model.details["thread-1"]?.messages.count == 60)
+    }
+
+    /// A background update must never widen the window. It used to: the client
+    /// keeps publishing the full transcript, so an uncapped store re-expanded
+    /// what had just been trimmed, and the two fought several times a second.
+    @Test
+    @MainActor
+    func backgroundUpdatesDoNotReopenTheWindow() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Long")
+        let history = (1 ... 200).map {
+            FeatureMessage(id: "m\($0)", role: .assistant, text: "text \($0)")
+        }
+        client.threadDetail = FeatureThreadDetail(thread: thread, messages: history)
+        let model = testRootModel(client: client)
+        _ = await model.detail(for: "thread-1", force: true)
+
+        // The same full transcript arriving again, as a stream update would.
+        _ = await model.detail(for: "thread-1", force: true)
+
+        #expect(model.details["thread-1"]?.messages.count == 60)
+    }
+
+    /// A thread restored from disk holds more history than the page the server
+    /// answers a refresh with. Reconciling those as prefixes collapses the
+    /// transcript to the page, and the renderer can only express a shrink as a
+    /// full rebuild — visible as the whole thread flashing.
+    @Test
+    @MainActor
+    func aShortServerPageDoesNotTruncateRestoredHistory() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Restored")
+        let history = (1 ... 6).map {
+            FeatureMessage(id: "m\($0)", role: .assistant, text: "text \($0)")
+        }
+        client.threadDetail = FeatureThreadDetail(thread: thread, messages: history)
+        let model = testRootModel(client: client)
+        _ = await model.detail(for: "thread-1", force: true)
+
+        client.threadDetail = FeatureThreadDetail(
+            thread: thread,
+            messages: Array(history.suffix(2))
+        )
+        _ = await model.detail(for: "thread-1", force: true)
+
+        #expect(
+            model.details["thread-1"]?.messages.map(\.id)
+                == ["m1", "m2", "m3", "m4", "m5", "m6"]
+        )
+    }
+
+    /// Connection is resolved before load state: a thread cannot be loading from
+    /// a computer it has not reached yet, and reporting "loading" during a slow
+    /// connect is what made the two indistinguishable.
+    @Test
+    func threadRefreshPresentationReportsConnectingBeforeLoading() {
+        #expect(
+            ThreadRefreshPresentation.resolve(
+                loadState: .loading,
+                connectionState: .connecting,
+                isOpening: true
+            ) == .connecting
+        )
+        #expect(
+            ThreadRefreshPresentation.resolve(
+                loadState: .loading,
+                connectionState: .connected,
+                isOpening: true
+            ) == .loading
+        )
+    }
+
+    /// "Connecting" is only actionable when it names which computer is slow.
+    @Test
+    func threadRefreshPresentationNamesTheEnvironmentWhileConnecting() {
+        #expect(
+            ThreadRefreshPresentation.connecting.title(environmentName: "Studio")
+                == "Connecting to Studio…"
+        )
+        #expect(ThreadRefreshPresentation.connecting.title() == "Connecting…")
+    }
+
+    /// Only catch-up states are busy; the ones a reader has to act on are not,
+    /// so a settled thread is never confirmed after a failure.
+    @Test
+    func threadRefreshPresentationMarksCatchUpStatesBusy() {
+        #expect(ThreadRefreshPresentation.connecting.isBusy)
+        #expect(ThreadRefreshPresentation.reconnecting.isBusy)
+        #expect(ThreadRefreshPresentation.loading.isBusy)
+        #expect(!ThreadRefreshPresentation.offline.isBusy)
+        #expect(!ThreadRefreshPresentation.failed.isBusy)
+    }
+
+    @MainActor
+    private func settle(_ model: FeatureRootModel) async {
+        for _ in 0 ..< 4 {
+            await Task.yield()
+        }
+    }
+}
+
 @MainActor
 private func testRootModel(client: FeatureClientStub) -> FeatureRootModel {
     FeatureRootModel(
@@ -2804,6 +2993,8 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var createdThread = FeatureThread(id: "created", projectID: "project", title: "Created")
     var threadDetail: FeatureThreadDetail?
     var earlierThreadDetail: FeatureThreadDetail?
+    var releasedThreadIDs: [String] = []
+    var loadThreadCallCount = 0
     var pairEndpoint: String?
     var pairToken: String?
     var sentText: String?
@@ -2968,7 +3159,12 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     }
     func deleteThread(id: String) async throws {}
 
+    func releaseThread(id: String) {
+        releasedThreadIDs.append(id)
+    }
+
     func loadThread(id: String) async throws -> FeatureThreadDetail {
+        loadThreadCallCount += 1
         if let loadThreadError {
             throw loadThreadError
         }

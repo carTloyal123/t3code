@@ -18,6 +18,22 @@ struct MarkdownDocument: Equatable, Sendable {
     fileprivate init(blocks: [MarkdownBlock]) {
         self.blocks = blocks
     }
+
+    /// The message split into its top-level blocks, as source.
+    ///
+    /// A long agent message is one very tall cell, and a self-sizing cell is
+    /// measured whole however little of it is on screen. Rendering each of
+    /// these as its own cell makes that cost proportional to the viewport
+    /// instead of to the message. Re-parsing a segment yields the same blocks
+    /// the whole document would, because the boundaries come from the parser
+    /// rather than from guessing at blank lines.
+    static func segments(parsing source: String) -> [String] {
+        var parser = MarkdownBlockParser(
+            source: CodexMarkdownDirectives.replacingFileCitations(in: source)
+        )
+        _ = parser.parse()
+        return parser.segments()
+    }
 }
 
 indirect enum MarkdownBlock: Equatable, Sendable {
@@ -208,6 +224,13 @@ private struct MarkdownBlockParser {
         lines = normalized.components(separatedBy: "\n")
     }
 
+    /// Source lines consumed by each top-level step of `parse()`.
+    ///
+    /// One entry per iteration rather than per block, because a paragraph step
+    /// can yield several blocks. Callers use these to re-parse one block of a
+    /// message on its own; see `MarkdownDocument.segments(parsing:)`.
+    private(set) var segmentRanges: [Range<Int>] = []
+
     mutating func parse() -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
 
@@ -217,54 +240,64 @@ private struct MarkdownBlockParser {
                 continue
             }
 
-            if let fence = fenceMarker(in: lines[index]) {
-                blocks.append(parseCodeBlock(opening: fence))
-                continue
-            }
-
-            if let template = CodexMarkdownDirectives.artifactTemplate(from: lines[index]) {
-                blocks.append(.artifactTemplate(template))
+            let start = index
+            let parsed = parseNextBlock()
+            // Every branch below consumes at least one line, but a future one
+            // that does not would spin here forever.
+            if index == start {
                 index += 1
-                continue
             }
-
-            if let heading = atxHeading(in: lines[index]) {
-                blocks.append(.heading(level: heading.level, text: heading.text))
-                index += 1
-                continue
-            }
-
-            if let table = tableOpening(at: index) {
-                blocks.append(parseTable(opening: table))
-                continue
-            }
-
-            if let level = setextHeadingLevel(after: index) {
-                blocks.append(.heading(level: level, text: lines[index].markdownTrimmed))
-                index += 2
-                continue
-            }
-
-            if blockquoteContent(in: lines[index]) != nil {
-                blocks.append(parseBlockquote())
-                continue
-            }
-
-            if let marker = listMarker(in: lines[index]) {
-                blocks.append(parseList(opening: marker))
-                continue
-            }
-
-            if isThematicBreak(lines[index]) {
-                blocks.append(.thematicBreak)
-                index += 1
-                continue
-            }
-
-            blocks.append(contentsOf: parseParagraph())
+            segmentRanges.append(start..<index)
+            blocks.append(contentsOf: parsed)
         }
 
         return blocks
+    }
+
+    private mutating func parseNextBlock() -> [MarkdownBlock] {
+        if let fence = fenceMarker(in: lines[index]) {
+            return [parseCodeBlock(opening: fence)]
+        }
+
+        if let template = CodexMarkdownDirectives.artifactTemplate(from: lines[index]) {
+            index += 1
+            return [.artifactTemplate(template)]
+        }
+
+        if let heading = atxHeading(in: lines[index]) {
+            index += 1
+            return [.heading(level: heading.level, text: heading.text)]
+        }
+
+        if let table = tableOpening(at: index) {
+            return [parseTable(opening: table)]
+        }
+
+        if let level = setextHeadingLevel(after: index) {
+            let text = lines[index].markdownTrimmed
+            index += 2
+            return [.heading(level: level, text: text)]
+        }
+
+        if blockquoteContent(in: lines[index]) != nil {
+            return [parseBlockquote()]
+        }
+
+        if let marker = listMarker(in: lines[index]) {
+            return [parseList(opening: marker)]
+        }
+
+        if isThematicBreak(lines[index]) {
+            index += 1
+            return [.thematicBreak]
+        }
+
+        return parseParagraph()
+    }
+
+    /// The raw source behind each `segmentRanges` entry.
+    func segments() -> [String] {
+        segmentRanges.map { lines[$0].joined(separator: "\n") }
     }
 
     private mutating func parseCodeBlock(opening: FenceMarker) -> MarkdownBlock {

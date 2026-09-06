@@ -51,6 +51,12 @@ public final class FeatureRootModel {
     private var pullRequestObservationIdentities: [String: String] = [:]
     public private(set) var details: [String: FeatureThreadDetail] = [:]
     private(set) var detailLoadStates: [String: FeatureThreadLoadState] = [:]
+    private var selectedThreadID: String?
+    private var renderWindowByThread: [String: Int] = [:]
+    private var warmedThreadIDs: Set<String> = []
+    private var warmQueue: [String] = []
+    private var warmTask: Task<Void, Never>?
+    private var selectedThreadLoad: Task<Void, Never>?
     /// Advances whenever a Home presentation input changes.
     public private(set) var homePresentationRevision: UInt64 = 0
     /// Advances when a Home-visible thread is inserted, removed, or changed.
@@ -101,6 +107,13 @@ public final class FeatureRootModel {
     }
 
     public func start() async {
+        // Show the last thread list immediately. `initialSnapshot()` reaches
+        // every environment before it returns, so waiting on it leaves the home
+        // screen empty for as long as the slowest computer takes to answer.
+        if let cached = await client.cachedSnapshot() {
+            install(cached)
+            isLoading = false
+        }
         do {
             install(try await client.initialSnapshot())
         } catch {
@@ -645,18 +658,175 @@ public final class FeatureRootModel {
         }
     }
 
+    /// How many older messages a single scrollback step pulls from disk.
+    ///
+    /// Small on purpose. Each page is inserted above the reader, which shifts
+    /// every index path below it, and compositional layout caches self-sizing
+    /// measurements by index path — so a page costs a re-measure whatever its
+    /// size. Ten keeps each of those short enough to disappear into the scroll
+    /// rather than landing as one long stall.
+    private static let storedEarlierMessageLimit = 10
+
     public func loadEarlierTurns(for id: String) async {
         guard details[id]?.page?.hasMore == true,
               details[id]?.page?.isLoading != true else { return }
+        // Disk first. History already synced is on the device; `hasMore` only
+        // describes what the server holds beyond what was ever fetched, so
+        // without this the reader waits on the network for turns already local.
+        if let current = details[id], let oldest = current.messages.first {
+            let older = await client.storedMessages(
+                before: oldest.id,
+                threadID: id,
+                limit: Self.storedEarlierMessageLimit
+            )
+            if !older.isEmpty {
+                renderWindowByThread[id] = renderWindow(for: id) + older.count
+                var next = current
+                next.messages = older + current.messages
+                store(next, invalidatesInFlightLoad: false)
+                return
+            }
+        }
         let environment = currentEnvironmentIdentity
         do {
             guard let detail = try await client.loadEarlierThreadTurns(id: id),
                   currentEnvironmentIdentity == environment else { return }
+            let added = detail.messages.count - (details[id]?.messages.count ?? 0)
+            if added > 0 {
+                renderWindowByThread[id] = renderWindow(for: id) + added
+            }
             store(detail, invalidatesInFlightLoad: false)
         } catch {
             if !Self.isBenignCancellation(error) {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    /// Selection owns thread loading and subscription, not view lifecycle.
+    /// The compact split view re-hosts the detail column when it opens, which
+    /// cancelled any view-scoped load and left the thread showing its previous
+    /// contents with no stream until it was opened a second time.
+    /// `isLoaded` is set by callers that already fetched the thread before
+    /// navigating to it. Reloading in that case would replace the content the
+    /// screen just opened with, which is visible as the transcript rebuilding
+    /// underneath the reader.
+    /// The thread as last persisted, adopted into `details` so the UI can open
+    /// it with no network in the path. Never overwrites content already in
+    /// memory, which is fresher by definition.
+    /// How many messages the transcript renders while the reader is at the
+    /// newest message.
+    ///
+    /// `UICollectionViewCompositionalLayout` recomputes the whole section on
+    /// every update — measured at ~0.13ms per row, so 247 rows cost ~32ms to
+    /// append one message to, several times a second while an agent streams.
+    /// Sixty rows keeps that inside a 120Hz frame, and makes even a full
+    /// rebuild cheap enough that the incremental path stops mattering.
+    private static let liveWindowMessageLimit = 60
+
+    /// How many messages a thread currently renders.
+    ///
+    /// Deliberately not derived from scroll position. An earlier version
+    /// collapsed the window whenever the reader was at the newest message, but
+    /// collapsing changes `contentSize`, which changes the position reading,
+    /// which flipped the decision straight back — the transcript oscillated
+    /// between 60 and 265 rows several times a second, rebuilding each time.
+    /// The window only grows when the reader explicitly pages back.
+    private func renderWindow(for id: String) -> Int {
+        renderWindowByThread[id] ?? Self.liveWindowMessageLimit
+    }
+
+    private func trimmedToWindow(_ detail: FeatureThreadDetail) -> FeatureThreadDetail {
+        let limit = renderWindow(for: detail.thread.id)
+        guard detail.messages.count > limit else { return detail }
+        var trimmed = detail
+        trimmed.messages = Array(detail.messages.suffix(limit))
+        return trimmed
+    }
+
+    public func storedDetail(for id: String) async -> FeatureThreadDetail? {
+        if let cached = details[id] { return cached }
+        guard let stored = await client.storedThread(id: id) else { return nil }
+        guard details[id] == nil else { return details[id] }
+        store(stored, invalidatesInFlightLoad: false)
+        return details[id]
+    }
+
+    /// Brings the local store up to date as soon as the thread list lands, so a
+    /// thread is already current when it is tapped rather than starting to load
+    /// then. Bounded to the threads a reader is realistically about to open —
+    /// syncing everything would put the whole account on the websocket, which
+    /// remote and relay connections cannot afford.
+    public func warmThreads(limit: Int = 30) {
+        warmThreads(
+            snapshot.threads
+                .filter { !$0.isArchived }
+                .sorted { ($0.lastActivityAt ?? $0.updatedAt) > ($1.lastActivityAt ?? $1.updatedAt) }
+                .prefix(limit)
+                .map(\.id)
+        )
+    }
+
+    /// Queues threads to bring up to date on disk. Requests accumulate rather
+    /// than being dropped while one is in flight, so a thread list that arrives
+    /// in pieces still ends up fully warmed — the previous one-shot version
+    /// silently skipped everything that arrived during the first pass.
+    public func warmThreads(_ ids: [String]) {
+        let additions = ids.filter {
+            !warmedThreadIDs.contains($0) && !warmQueue.contains($0)
+        }
+        guard !additions.isEmpty else { return }
+        warmQueue.append(contentsOf: additions)
+        guard warmTask == nil else { return }
+        warmTask = Task { [weak self] in
+            while let next = self?.dequeueThreadToWarm() {
+                guard !Task.isCancelled else { break }
+                await self?.client.warmThread(id: next)
+            }
+            // History comes second. Warming makes every thread openable; the
+            // backfill that follows makes them complete, and would otherwise
+            // hold the socket while the threads a reader can see are still
+            // empty.
+            for id in self?.warmedThreadIDs.sorted() ?? [] {
+                guard !Task.isCancelled else { break }
+                await self?.client.backfillThread(id: id)
+            }
+            self?.warmTask = nil
+        }
+    }
+
+    private func dequeueThreadToWarm() -> String? {
+        guard !warmQueue.isEmpty else { return nil }
+        let id = warmQueue.removeFirst()
+        warmedThreadIDs.insert(id)
+        return id
+    }
+
+    public func selectThread(_ id: String?, isLoaded: Bool = false) {
+        guard selectedThreadID != id else { return }
+        selectedThreadLoad?.cancel()
+        selectedThreadLoad = nil
+        if let previous = selectedThreadID {
+            releaseThread(previous)
+        }
+        if let previous = selectedThreadID {
+            renderWindowByThread.removeValue(forKey: previous)
+        }
+        selectedThreadID = id
+        guard let id else { return }
+        selectedThreadLoad = Task { [weak self] in
+            guard let self else { return }
+            // Resume from disk when we can: the server replays only what we
+            // missed, so the transcript on screen is extended rather than
+            // replaced. A full load re-sends the most recent page, which is a
+            // different message set to whatever is already rendered.
+            if let resumed = await self.client.resumeThread(id: id) {
+                self.store(resumed, invalidatesInFlightLoad: false)
+                self.upsert(resumed.thread)
+                return
+            }
+            guard !isLoaded else { return }
+            _ = await self.detail(for: id, force: true)
         }
     }
 
@@ -917,6 +1087,7 @@ public final class FeatureRootModel {
         switch event {
         case let .snapshot(value):
             install(value)
+            warmThreads()
         case let .connection(value):
             guard snapshot.connection != value else { return }
             snapshot.connection = value
@@ -949,6 +1120,11 @@ public final class FeatureRootModel {
         var metadataChanged = false
         if let index = snapshot.threads.firstIndex(where: { $0.id == thread.id }) {
             let previous = snapshot.threads[index]
+            // Settling is the point a thread stops being worked on, so its older
+            // turns stop earning their disk. Trim once, on the transition.
+            if !previous.isSettled, thread.isSettled {
+                Task { [client] in await client.pruneThread(id: thread.id) }
+            }
             if previous != thread {
                 snapshot.threads[index] = thread
                 metadataChanged = true
@@ -1103,7 +1279,7 @@ public final class FeatureRootModel {
         let next = details[id].map { current in
             FeatureThreadDetail(
                 thread: prepared.thread,
-                messages: replacingChangedSuffix(current.messages, with: prepared.messages),
+                messages: mergingHistory(current.messages, with: prepared.messages),
                 approvals: replacingChangedSuffix(current.approvals, with: prepared.approvals),
                 userInputs: replacingChangedSuffix(current.userInputs, with: prepared.userInputs),
                 page: prepared.page,
@@ -1111,8 +1287,9 @@ public final class FeatureRootModel {
                 backgroundWorkIsActive: prepared.backgroundWorkIsActive
             )
         } ?? prepared
-        guard details[id] != next else { return }
-        details[id] = next
+        let windowed = trimmedToWindow(next)
+        guard details[id] != windowed else { return }
+        details[id] = windowed
         markDetailRecentlyUsed(id)
         if invalidatesInFlightLoad {
             bumpDetailLoadRevision(id: id)
@@ -1126,9 +1303,20 @@ public final class FeatureRootModel {
         let id = incoming.thread.id
         acknowledgeDeliveredMessages(incoming.messages)
         let next = addingPendingMessages(to: incoming)
-        details[id] = next
+        // The same window applies here as on the full path. The client keeps
+        // publishing the whole transcript, so leaving this one uncapped let a
+        // streamed delta re-expand what the full path had just trimmed, and the
+        // two rebuilt the section against each other several times a second.
+        let trimmed = trimmedToWindow(next)
+        details[id] = trimmed
         markDetailRecentlyUsed(id)
         bumpDetailLoadRevision(id: id)
+        guard trimmed.messages.count == next.messages.count else {
+            // Trimming drops messages the delta does not describe, so the
+            // renderer has to diff instead of applying it.
+            bumpDetailRevision(id: id, change: .full)
+            return
+        }
         let appended = next.messages.dropFirst(incoming.messages.count).map(\.id)
         let pendingDelta = FeatureDetailDelta(
             changedMessages: delta.changedMessages + next.messages.dropFirst(incoming.messages.count),
@@ -1176,6 +1364,10 @@ public final class FeatureRootModel {
     }
 
     private func clearDetails() {
+        warmedThreadIDs.removeAll()
+        warmQueue.removeAll()
+        warmTask?.cancel()
+        warmTask = nil
         detailLoadGeneration &+= 1
         detailLoadRevisions.removeAll()
         storedDetailLoadRequestRevisions.removeAll()
@@ -1223,6 +1415,29 @@ public final class FeatureRootModel {
             revision: detailRevision,
             change: change
         )
+    }
+
+    /// Reconciles a server page against what is already loaded.
+    ///
+    /// `replacingChangedSuffix` aligns on a common *prefix*, which is right when
+    /// both sides start at the same message. A refresh does not: it returns the
+    /// most recent turns, while the local copy may hold far more history behind
+    /// them. Aligned as prefixes those share nothing, so the transcript would
+    /// collapse to the page — and the renderer can only express a shrink as a
+    /// full rebuild, which is visible as the whole thread flashing.
+    ///
+    /// Find where the page begins in what we already have and keep everything
+    /// older than it untouched.
+    private func mergingHistory(
+        _ current: [FeatureMessage],
+        with incoming: [FeatureMessage]
+    ) -> [FeatureMessage] {
+        guard !current.isEmpty, let first = incoming.first else { return incoming }
+        guard let overlap = current.firstIndex(where: { $0.id == first.id }), overlap > 0 else {
+            return replacingChangedSuffix(current, with: incoming)
+        }
+        return Array(current[..<overlap])
+            + replacingChangedSuffix(Array(current[overlap...]), with: incoming)
     }
 
     private func replacingChangedSuffix<Element: Equatable>(

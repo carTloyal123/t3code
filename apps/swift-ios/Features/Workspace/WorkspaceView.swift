@@ -60,6 +60,11 @@ public struct WorkspaceView: View {
     @State private var renameTitle = ""
     @State private var sidebarBoundaryNow = Date.now
     @State private var preferredCompactColumn = NavigationSplitViewColumn.sidebar
+    /// The thread being fetched before its screen is pushed. The row shows it
+    /// as pending; the detail column is not entered until the content is in
+    /// hand, so the push animates over a transcript that is already complete.
+    @State private var openingThreadID: String?
+    @State private var openThreadTask: Task<Void, Never>?
     @State private var homePresentationCache = HomePresentationCache()
     @FocusState private var isSearchFocused: Bool
 
@@ -209,9 +214,6 @@ public struct WorkspaceView: View {
         .onChange(of: selectedThreadIsAvailable) { _, isAvailable in
             if !isAvailable { closeSelectedThread() }
         }
-        .onChange(of: selectedThreadID) { _, newValue in
-            preferredCompactColumn = newValue == nil ? .sidebar : .detail
-        }
         .onChange(of: selectedProjectIsAvailable) { _, isAvailable in
             if !isAvailable { selectedProjectID = nil }
         }
@@ -273,7 +275,7 @@ public struct WorkspaceView: View {
                 presentation: presentation,
                 projectFaviconClient: model.client,
                 query: searchText,
-                selectedThreadID: threadSelection.highlightedID,
+                selectedThreadID: openingThreadID ?? threadSelection.highlightedID,
                 forceRichRows: dynamicTypeSize.isAccessibilitySize,
                 hapticsEnabled: model.snapshot.settings.hapticsEnabled,
                 settings: model.snapshot.settings,
@@ -283,6 +285,7 @@ public struct WorkspaceView: View {
                 isArchiveExpanded: isArchiveExpanded,
                 settledLimit: settledLimit,
                 onOpen: openThread,
+                onThreadBecameVisible: { model.warmThreads([$0]) },
                 onToggleSnoozed: { isSnoozedExpanded.toggle() },
                 onToggleSettled: { isSettledExpanded.toggle() },
                 onToggleArchive: { isArchiveExpanded.toggle() },
@@ -622,14 +625,55 @@ public struct WorkspaceView: View {
         return model.snapshot.projects.contains { $0.id == selectedProjectID }
     }
 
+    /// Thread subscriptions follow selection rather than the detail view's
+    /// appear/disappear, which fires spuriously while the split view re-hosts
+    /// the detail column.
+    /// Loads the thread before navigating to it. Pushing first and filling in
+    /// afterwards is what made a cold open ugly: the screen slid in empty, then
+    /// content arrived and the transcript measured itself into place in front
+    /// of the reader. Waiting costs a moment on the row instead.
     private func openThread(_ id: String) {
+        openThreadTask?.cancel()
+        if model.details[id] != nil {
+            enterThread(id)
+            return
+        }
+        openingThreadID = id
+        openThreadTask = Task {
+            // Disk first. Warming runs from launch, so the stored copy is
+            // usually already current and this returns without a round trip.
+            // Entering with `isLoaded: false` lets the server reconcile behind
+            // the screen instead of in front of it.
+            if await model.storedDetail(for: id) != nil {
+                guard !Task.isCancelled, openingThreadID == id else { return }
+                openingThreadID = nil
+                enterThread(id)
+                return
+            }
+            _ = await model.detail(for: id, force: true)
+            guard !Task.isCancelled, openingThreadID == id else { return }
+            openingThreadID = nil
+            enterThread(id, isLoaded: true)
+        }
+    }
+
+    private func enterThread(_ id: String, isLoaded: Bool = false) {
         threadSelection.open(id)
         preferredCompactColumn = .detail
+        model.selectThread(id, isLoaded: isLoaded)
+    }
+
+    private func cancelPendingOpen() {
+        openThreadTask?.cancel()
+        openThreadTask = nil
+        openingThreadID = nil
     }
 
     private func closeSelectedThread() {
+        cancelPendingOpen()
         threadSelection.close()
         preferredCompactColumn = .sidebar
+        model.selectThread(nil)
     }
 
     @MainActor

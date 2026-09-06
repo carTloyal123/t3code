@@ -830,6 +830,7 @@ struct HomeThreadSwipeActionTests {
             isArchiveExpanded: false,
             settledLimit: 12,
             onOpen: { _ in },
+            onThreadBecameVisible: { _ in },
             onToggleSnoozed: {},
             onToggleSettled: {},
             onToggleArchive: {},

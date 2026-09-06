@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Testing
 import UIKit
 @testable import T3Code
@@ -521,7 +522,7 @@ struct MarkdownDocumentTests {
     }
 
     @Test @MainActor
-    func selectableTextAttributesPreserveInlineFormatting() throws {
+    func inlineAttributesPreserveFormattingAndLinks() throws {
         let revision = MarkdownContentRevision(
             "Use **bold**, *emphasis*, `code`, ~~removed~~, and [docs](https://example.com)."
         )
@@ -533,92 +534,69 @@ struct MarkdownDocumentTests {
             return
         }
 
-        let attributed = MarkdownSelectableTextAttributes.make(
+        let attributed = MarkdownSelectableTextAttributes.attributedText(
             from: inline,
-            lineSpacing: 4,
-            foregroundColor: T3Colors.uiTextSecondary
-        )
-        let text = attributed.string as NSString
-        let boldIndex = try #require(index(of: "bold", in: text))
-        let emphasisIndex = try #require(index(of: "emphasis", in: text))
-        let codeIndex = try #require(index(of: "code", in: text))
-        let removedIndex = try #require(index(of: "removed", in: text))
-        let linkIndex = try #require(index(of: "docs", in: text))
-
-        let boldFont = try #require(
-            attributed.attribute(.font, at: boldIndex, effectiveRange: nil) as? UIFont
-        )
-        let emphasisFont = try #require(
-            attributed.attribute(.font, at: emphasisIndex, effectiveRange: nil) as? UIFont
-        )
-        let codeFont = try #require(
-            attributed.attribute(.font, at: codeIndex, effectiveRange: nil) as? UIFont
-        )
-        let paragraphStyle = try #require(
-            attributed.attribute(.paragraphStyle, at: 0, effectiveRange: nil)
-                as? NSParagraphStyle
+            foregroundColor: T3Colors.uiTextSecondary,
+            dynamicTypeSize: .large
         )
 
-        #expect(boldFont.fontDescriptor.symbolicTraits.contains(.traitBold))
-        #expect(emphasisFont.fontDescriptor.symbolicTraits.contains(.traitItalic))
-        #expect(codeFont.fontDescriptor.symbolicTraits.contains(.traitMonoSpace))
         #expect(
-            attributed.attribute(.backgroundColor, at: codeIndex, effectiveRange: nil)
-                as? UIColor == T3Colors.uiSurfaceRaised
+            String(attributed.characters) == "Use bold, emphasis, code, removed, and docs."
         )
-        #expect(
-            attributed.attribute(.strikethroughStyle, at: removedIndex, effectiveRange: nil)
-                as? Int == NSUnderlineStyle.single.rawValue
+
+        let code = try #require(run("code", in: attributed))
+        #expect(attributed[code].backgroundColor == Color(uiColor: T3Colors.uiSurfaceRaised))
+
+        let removed = try #require(run("removed", in: attributed))
+        #expect(attributed[removed].strikethroughStyle == .single)
+
+        let bold = try #require(run("bold", in: attributed))
+        #expect(attributed[bold].foregroundColor == Color(uiColor: T3Colors.uiTextSecondary))
+
+        let docs = try #require(run("docs", in: attributed))
+        #expect(attributed[docs].link == URL(string: "https://example.com"))
+        // Links take the accent colour rather than the caller's foreground.
+        #expect(attributed[docs].foregroundColor == Color(uiColor: T3Colors.uiAccent))
+    }
+
+    /// `Text` renders `inlinePresentationIntent` only against fonts it owns, so
+    /// each run's font is resolved up front. That resolution is the part that
+    /// broke bold, and the only part still inspectable once it reaches SwiftUI.
+    @Test @MainActor
+    func inlineIntentsResolveToTraitedFonts() {
+        let bold = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: .stronglyEmphasized, dynamicTypeSize: .large
         )
-        #expect(
-            attributed.attribute(.foregroundColor, at: boldIndex, effectiveRange: nil)
-                as? UIColor == T3Colors.uiTextSecondary
+        let italic = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: .emphasized, dynamicTypeSize: .large
         )
-        #expect(
-            attributed.attribute(.link, at: linkIndex, effectiveRange: nil) as? URL
-                == URL(string: "https://example.com")
+        let code = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: .code, dynamicTypeSize: .large
         )
-        #expect(
-            attributed.string
-                == "Use bold, emphasis, code, removed, and docs."
+        let plain = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: nil, dynamicTypeSize: .large
         )
-        #expect(paragraphStyle.lineSpacing == 4)
+
+        #expect(bold.fontDescriptor.symbolicTraits.contains(.traitBold))
+        #expect(italic.fontDescriptor.symbolicTraits.contains(.traitItalic))
+        #expect(code.fontDescriptor.symbolicTraits.contains(.traitMonoSpace))
+        #expect(!plain.fontDescriptor.symbolicTraits.contains(.traitBold))
     }
 
     @Test @MainActor
-    func selectableTextAttributesHonorDynamicTypeSize() throws {
-        let document = try #require(
-            MarkdownRenderCache.shared.documentImmediately(
-                for: MarkdownContentRevision("Readable body text")
-            )
+    func inlineFontsHonorDynamicTypeSize() {
+        let small = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: nil, dynamicTypeSize: .small
         )
-        guard case let .paragraph(inline) = document.blocks.first else {
-            Issue.record("Expected a rendered paragraph")
-            return
-        }
-
-        let small = MarkdownSelectableTextAttributes.make(
-            from: inline,
-            lineSpacing: 4,
-            dynamicTypeSize: .small
-        )
-        let accessibility = MarkdownSelectableTextAttributes.make(
-            from: inline,
-            lineSpacing: 4,
-            dynamicTypeSize: .accessibility1
-        )
-        let smallFont = try #require(
-            small.attribute(.font, at: 0, effectiveRange: nil) as? UIFont
-        )
-        let accessibilityFont = try #require(
-            accessibility.attribute(.font, at: 0, effectiveRange: nil) as? UIFont
+        let accessibility = MarkdownSelectableTextAttributes.font(
+            for: .body, intent: nil, dynamicTypeSize: .accessibility1
         )
 
-        #expect(accessibilityFont.pointSize > smallFont.pointSize)
+        #expect(accessibility.pointSize > small.pointSize)
     }
 
     @Test @MainActor
-    func codeBlocksReuseSelectableInlineRendering() throws {
+    func codeBlocksReuseInlineRendering() throws {
         let literalCode = "x = arr[i](fn)\na **b** c\nprintf(\\\"a\\\\tb\\\");"
         let cache = MarkdownRenderCache()
         let first = try #require(
@@ -644,46 +622,123 @@ struct MarkdownDocumentTests {
         #expect(firstInline === secondInline)
         #expect(firstInline.style == .code)
 
-        let attributed = MarkdownSelectableTextAttributes.make(
+        // Code is rendered verbatim: no inline Markdown is applied inside it.
+        let attributed = MarkdownSelectableTextAttributes.attributedText(
             from: firstInline,
-            lineSpacing: 3
+            foregroundColor: T3Colors.uiTextPrimary,
+            dynamicTypeSize: .large
         )
-        let font = try #require(
-            attributed.attribute(.font, at: 0, effectiveRange: nil) as? UIFont
-        )
-        #expect(attributed.string == firstCode)
-        #expect(font.fontDescriptor.symbolicTraits.contains(.traitMonoSpace))
+        #expect(String(attributed.characters) == firstCode)
+    }
+
+    private func run(
+        _ text: String,
+        in attributed: AttributedString
+    ) -> Range<AttributedString.Index>? {
+        attributed.runs
+            .first { String(attributed[$0.range].characters) == text }?
+            .range
+    }
+
+
+}
+
+@Suite("Chat Markdown segments")
+struct MarkdownSegmentTests {
+    /// The transcript renders one cell per segment, so a segment parsed alone
+    /// has to produce exactly the blocks it contributed to the whole document.
+    /// Anything else means a message renders differently once it is split.
+    private func expectSegmentsReproduceDocument(
+        _ source: String,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        let whole = MarkdownDocument(parsing: source).blocks
+        let rejoined = MarkdownDocument.segments(parsing: source)
+            .flatMap { MarkdownDocument(parsing: $0).blocks }
+        #expect(rejoined == whole, sourceLocation: sourceLocation)
     }
 
     @Test
-    func restoresSelectionOnlyWhenTextIsExtended() {
-        let selection = NSRange(location: 7, length: 5)
+    func paragraphsSplitIntoOneSegmentEach() {
+        let segments = MarkdownDocument.segments(parsing: "First para.\n\nSecond para.")
 
-        #expect(
-            MarkdownSelectionRestoration.range(
-                previousText: "Hello, world",
-                previousRange: selection,
-                newText: "Hello, world!"
-            ) == selection
-        )
-        #expect(
-            MarkdownSelectionRestoration.range(
-                previousText: "Hello, world",
-                previousRange: selection,
-                newText: "Different text"
-            ) == NSRange(location: 0, length: 0)
-        )
-        #expect(
-            MarkdownSelectionRestoration.range(
-                previousText: "Hello, world",
-                previousRange: NSRange(location: 7, length: 20),
-                newText: "Hello, world!"
-            ) == NSRange(location: 0, length: 0)
+        #expect(segments == ["First para.", "Second para."])
+    }
+
+    @Test
+    func fencedCodeStaysWhole() {
+        let source = "Before.\n\n```swift\nlet a = 1\n\nlet b = 2\n```\n\nAfter."
+        let segments = MarkdownDocument.segments(parsing: source)
+
+        #expect(segments.count == 3)
+        #expect(segments[1] == "```swift\nlet a = 1\n\nlet b = 2\n```")
+        expectSegmentsReproduceDocument(source)
+    }
+
+    @Test
+    func listsSurviveBlankLinesBetweenItems() {
+        let source = "- one\n\n- two\n\n- three"
+        let segments = MarkdownDocument.segments(parsing: source)
+
+        #expect(segments.count == 1)
+        expectSegmentsReproduceDocument(source)
+    }
+
+    @Test
+    func blockquotesTablesAndHeadingsRoundTrip() {
+        expectSegmentsReproduceDocument(
+            """
+            # Heading
+
+            > quoted line
+            > and another
+
+            | a | b |
+            | --- | --- |
+            | 1 | 2 |
+
+            Trailing paragraph.
+            """
         )
     }
 
-    private func index(of substring: String, in text: NSString) -> Int? {
-        let range = text.range(of: substring)
-        return range.location == NSNotFound ? nil : range.location
+    @Test
+    func setextHeadingsAndThematicBreaksRoundTrip() {
+        expectSegmentsReproduceDocument(
+            """
+            Title
+            =====
+
+            ---
+
+            Body text.
+            """
+        )
+    }
+
+    @Test
+    func mixedMessageRoundTrips() {
+        expectSegmentsReproduceDocument(
+            """
+            Here is **bold** prose with `code`.
+
+            1. first
+            2. second
+
+            ```
+            plain fence
+            ```
+
+            ![alt](https://example.com/a.png)
+
+            Closing words.
+            """
+        )
+    }
+
+    @Test
+    func emptyAndBlankSourcesProduceNoSegments() {
+        #expect(MarkdownDocument.segments(parsing: "").isEmpty)
+        #expect(MarkdownDocument.segments(parsing: "\n\n   \n").isEmpty)
     }
 }

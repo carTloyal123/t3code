@@ -160,6 +160,36 @@ public protocol FeatureClient: AnyObject {
     ) async throws
     func invalidatePullRequests(_ target: FeaturePullRequestTarget?) async throws
 
+    /// The last thread list seen, from disk, so a cold launch has something to
+    /// show before the network answers.
+    func cachedSnapshot() async -> FeatureSnapshot?
+    /// The thread as it was last persisted, without touching the network.
+    /// Opening a thread renders this first; the server only reconciles.
+    func storedThread(id: String) async -> FeatureThreadDetail?
+    /// Messages already on disk that sit immediately before `messageID`. Empty
+    /// when disk cannot satisfy the request and the server has to be asked.
+    func storedMessages(
+        before messageID: String,
+        threadID: String,
+        limit: Int
+    ) async -> [FeatureMessage]
+    /// Walks a thread's history to disk, oldest page last, paced so it stays in
+    /// the background.
+    func backfillThread(id: String) async
+    /// Trims a settled thread's stored history to a recent window.
+    func pruneThread(id: String) async
+    /// Bytes the on-device history occupies.
+    func historyCacheSize() async -> Int64
+    /// Drops all stored history. The next launch refetches it.
+    func clearHistoryCache() async
+    /// Fetches a thread and persists it without making it the active thread —
+    /// no stream is started and no active-thread state is disturbed. Used to
+    /// bring the local store up to date in the background.
+    func warmThread(id: String) async
+    /// Opens a stored thread and resumes its subscription from the sequence on
+    /// disk, without fetching a snapshot. Nil when nothing usable is stored.
+    func resumeThread(id: String) async -> FeatureThreadDetail?
+
     func cachedProjectFavicon(
         environmentID: String,
         workspaceRoot: String
@@ -325,6 +355,19 @@ public extension FeatureClient {
         requested: Bool
     ) async throws { throw FeatureCapabilityUnavailable("Pull request reviewers") }
     func invalidatePullRequests(_ target: FeaturePullRequestTarget?) async throws {}
+    func cachedSnapshot() async -> FeatureSnapshot? { nil }
+    func storedThread(id: String) async -> FeatureThreadDetail? { nil }
+    func storedMessages(
+        before messageID: String,
+        threadID: String,
+        limit: Int
+    ) async -> [FeatureMessage] { [] }
+    func backfillThread(id: String) async {}
+    func pruneThread(id: String) async {}
+    func historyCacheSize() async -> Int64 { 0 }
+    func clearHistoryCache() async {}
+    func warmThread(id: String) async {}
+    func resumeThread(id: String) async -> FeatureThreadDetail? { nil }
     func cachedProjectFavicon(environmentID: String, workspaceRoot: String) async -> Data? {
         nil
     }

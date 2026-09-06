@@ -33,7 +33,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         category: "T3Connect"
     )
     private static let initialThreadUserTurnLimit = 10
+    /// How much of a stored thread is read on open. The rendered window is
+    /// bounded separately by the model, so this only needs to be enough to fill
+    /// a screen and a little beyond.
+    private static let storedThreadMessageLimit = 60
     private static let olderThreadPageUserTurnLimit = 20
+    /// Gap between history pages while backfilling. Slow on purpose — the
+    /// reader's own traffic shares this socket.
+    private static let backfillPageIntervalMilliseconds = 400
+    /// What a settled thread keeps on disk. Roughly ten turns — turns are not a
+    /// unit the store knows about, so this is expressed in messages.
+    private static let settledThreadMessageLimit = 40
     private static let projectFaviconRefreshInterval: TimeInterval = 15 * 60
     private static let projectFaviconFallbackMarker = "project-favicon-missing"
 
@@ -42,6 +52,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private let t3ConnectDeviceManager: any T3ConnectDeviceManaging
     private let hasMatchingT3ConnectController: Bool
     private let settingsStore: UserDefaults
+    private let threadStore: ThreadStore
+    private let shellSnapshotStore: ShellSnapshotStore
     private let projectFaviconStore: FeatureProjectFaviconStore
     private let fallbackPollingInitialDelay: Duration
     private let fallbackPollingInterval: Duration
@@ -70,7 +82,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var environmentConnectionDetails: [String: String] = [:]
     private var latestServerConfig: ServerConfigSnapshot?
     private var serverConfigsByEnvironmentID: [String: ServerConfigSnapshot] = [:]
-    private var latestSnapshot: FeatureSnapshot?
+    private var latestSnapshot: FeatureSnapshot? {
+        didSet {
+            guard let latestSnapshot, latestSnapshot != oldValue else { return }
+            let store = shellSnapshotStore
+            Task.detached(priority: .utility) { await store.save(latestSnapshot) }
+        }
+    }
     private var activeThreadID: String?
     private var activeThreadEnvironmentID: String?
     private var latestDetails: [String: FeatureThreadDetail] = [:]
@@ -108,6 +126,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var detailStreamTask: Task<Void, Never>?
     private var detailPublishTask: Task<Void, Never>?
     private var passiveDetailPollingTask: Task<Void, Never>?
+    /// How much history the active thread currently has loaded, in user turns.
+    /// Refreshes have to ask for at least this much: requesting the initial
+    /// page instead drops everything beyond it, and the transcript visibly
+    /// collapses and refills on every streamed event.
+    private var loadedUserTurnLimit: Int?
     private var detailRefreshPending = false
     private var detailRefreshGeneration = 0
     private var detailStreamGeneration = 0
@@ -125,6 +148,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         t3ConnectController: T3ConnectController? = nil,
         t3ConnectDeviceManager: (any T3ConnectDeviceManaging)? = nil,
         settingsStore: UserDefaults = .standard,
+        threadStore: ThreadStore = ThreadStore(),
+        shellSnapshotStore: ShellSnapshotStore = ShellSnapshotStore(),
         projectFaviconStore: FeatureProjectFaviconStore = FeatureProjectFaviconStore(),
         fallbackPollingInitialDelay: Duration = .seconds(3),
         fallbackPollingInterval: Duration = .seconds(2),
@@ -155,6 +180,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             managedAuthorization: T3ConnectRuntimeAuthorization(controller: controller)
         )
         self.settingsStore = settingsStore
+        self.threadStore = threadStore
+        self.shellSnapshotStore = shellSnapshotStore
         self.projectFaviconStore = projectFaviconStore
         self.fallbackPollingInitialDelay = fallbackPollingInitialDelay
         self.fallbackPollingInterval = fallbackPollingInterval
@@ -180,6 +207,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         attachmentHydrationTasks.values.forEach { $0.task.cancel() }
         projectFaviconRefreshTasks.values.forEach { $0.cancel() }
         continuation.finish()
+    }
+
+    /// The last thread list seen, straight from disk. Rendered while
+    /// `initialSnapshot()` is still talking to the network.
+    func cachedSnapshot() async -> FeatureSnapshot? {
+        await shellSnapshotStore.snapshot()
     }
 
     func initialSnapshot() async throws -> FeatureSnapshot {
@@ -409,6 +442,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             try await runtime.revokeCredential(id: id)
         }
         try await runtime.remove(id: id)
+        // Removing an environment removes its history from the device too. The
+        // store outlives the process, so leaving it would keep a signed-out
+        // computer's transcripts readable on disk.
+        await threadStore.clearEnvironment(id)
         if removesActiveEnvironment {
             await clearActiveEnvironment(disconnectClient: false)
         }
@@ -755,6 +792,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         activeRawThread = nil
         activeThreadSequence = nil
         activeThreadPage = nil
+        loadedUserTurnLimit = nil
         threadHistoryEpoch &+= 1
         pendingOlderThreadPage = nil
         latestDetails.removeAll()
@@ -1605,6 +1643,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             )
         }
         provisionalThreadRoutes[route.uiID] = nil
+        let store = threadStore
+        let environmentID = route.environmentID
+        let uiID = route.uiID
+        Task.detached(priority: .utility) {
+            await store.removeThread(environmentID: environmentID, threadID: uiID)
+        }
         if activeThreadID == route.uiID {
             resetDetailRefresh()
             resetDetailStream()
@@ -1618,6 +1662,177 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         detailCacheRecency.removeAll { $0 == route.uiID }
         await emitCachedSnapshot(for: route.environmentID)
         try? await refresh(client: route.client, includeArchived: true)
+    }
+
+    func storedThread(id: String) async -> FeatureThreadDetail? {
+        guard let route = try? threadRoute(for: id) else { return nil }
+        guard let stored = await threadStore.loadThread(
+            environmentID: route.environmentID,
+            threadID: route.uiID,
+            limit: Self.storedThreadMessageLimit
+        ) else { return nil }
+        return FeatureThreadDetail(
+            thread: stored.thread,
+            messages: stored.messages,
+            page: stored.page
+        )
+    }
+
+    func storedMessages(
+        before messageID: String,
+        threadID: String,
+        limit: Int
+    ) async -> [FeatureMessage] {
+        guard let route = try? threadRoute(for: threadID) else { return [] }
+        return await threadStore.messages(
+            before: messageID,
+            environmentID: route.environmentID,
+            threadID: route.uiID,
+            limit: limit
+        )
+    }
+
+    /// Trims a settled thread to a recent window. The page cursor survives, so
+    /// scrolling back still works — it just fetches again rather than reading
+    /// from disk.
+    func pruneThread(id: String) async {
+        guard let route = try? threadRoute(for: id) else { return }
+        await threadStore.prune(
+            environmentID: route.environmentID,
+            threadID: route.uiID,
+            keeping: Self.settledThreadMessageLimit
+        )
+    }
+
+    func historyCacheSize() async -> Int64 {
+        await threadStore.sizeOnDisk() + RemoteImageCache.sizeOnDisk
+    }
+
+    func clearHistoryCache() async {
+        await threadStore.clearAll()
+        await shellSnapshotStore.clear()
+        RemoteImageCache.clear()
+    }
+
+    /// Walks a thread's history backwards until the server has nothing older,
+    /// writing each page to disk. Touches no active-thread state, so it is safe
+    /// to run for any thread at any time.
+    ///
+    /// Paced deliberately: a full history walk across an account is a lot of
+    /// websocket traffic, and remote and relay connections carry it over the
+    /// same socket the reader is using. One page at a time with a gap between
+    /// them keeps it in the background where it belongs.
+    func backfillThread(id: String) async {
+        guard let route = try? threadRoute(for: id) else { return }
+        let environment = route.client.environment
+        let generation = environmentGeneration
+        guard serverConfigsByEnvironmentID[environment.id]?.threadSnapshotPagination == true else {
+            return
+        }
+        while !Task.isCancelled {
+            guard let page = await threadStore.storedPage(
+                environmentID: environment.id,
+                threadID: route.uiID
+            ), page.hasMore, let cursor = page.beforeCursor else { return }
+            guard let snapshot = try? await route.client.threadSnapshot(
+                id: route.wireID,
+                turnLimit: Self.olderThreadPageUserTurnLimit,
+                beforeCursor: cursor
+            ), isKnownClient(route.client, environmentID: environment.id, generation: generation)
+            else { return }
+            let messages = renderedHistoryMessages(
+                snapshot.thread,
+                environmentID: environment.id
+            )
+            guard !messages.isEmpty else { return }
+            await threadStore.prepend(
+                messages: messages,
+                environmentID: environment.id,
+                threadID: route.uiID,
+                page: featurePage(snapshot.page)
+            )
+            try? await Task.sleep(for: .milliseconds(Self.backfillPageIntervalMilliseconds))
+        }
+    }
+
+    /// Deliberately touches none of the active-thread state and starts no
+    /// stream, so warming a thread in the background cannot tear down the
+    /// subscription of the thread the reader is actually looking at.
+    func warmThread(id: String) async {
+        guard let route = try? threadRoute(for: id) else { return }
+        let environment = route.client.environment
+        let generation = environmentGeneration
+        let supportsPagination = serverConfigsByEnvironmentID[
+            environment.id
+        ]?.threadSnapshotPagination == true
+        guard let snapshot = try? await route.client.threadSnapshot(
+            id: route.wireID,
+            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
+        ) else { return }
+        guard isKnownClient(route.client, environmentID: environment.id, generation: generation) else {
+            return
+        }
+        let detail = mapDetail(
+            snapshot.thread,
+            environment: environment,
+            sourceSequence: snapshot.snapshotSequence,
+            page: featurePage(snapshot.page)
+        )
+        await threadStore.replace(
+            detail,
+            environmentID: environment.id,
+            sequence: snapshot.snapshotSequence,
+            raw: snapshot.thread
+        )
+    }
+
+    /// Opens a thread from what is already on disk and resumes its subscription
+    /// from the stored sequence, with no snapshot fetch. The server replays the
+    /// events we missed, or sends a snapshot itself when the gap is too wide —
+    /// so this is correct whether the thread is seconds or weeks stale.
+    ///
+    /// Returns nil when there is nothing usable stored, and the caller falls
+    /// back to a normal load.
+    func resumeThread(id: String) async -> FeatureThreadDetail? {
+        guard let route = try? threadRoute(for: id) else { return nil }
+        let environment = route.client.environment
+        guard let stored = await threadStore.loadThread(
+            environmentID: environment.id,
+            threadID: route.uiID,
+            limit: Self.storedThreadMessageLimit
+        ), stored.sequence > 0,
+        let raw = await threadStore.loadRawThread(
+            environmentID: environment.id,
+            threadID: route.uiID
+        ) else { return nil }
+
+        resetDetailRefresh()
+        resetDetailStream()
+        passiveDetailPollingTask?.cancel()
+        passiveDetailPollingTask = nil
+        activeThreadID = route.uiID
+        activeThreadEnvironmentID = environment.id
+        threadHistoryEpoch &+= 1
+        pendingOlderThreadPage = nil
+        activeThreadPage = stored.page
+        activeRawThread = raw
+        activeThreadSequence = stored.sequence
+        loadedUserTurnLimit = serverConfigsByEnvironmentID[
+            environment.id
+        ]?.threadSnapshotPagination == true ? Self.initialThreadUserTurnLimit : nil
+
+        let detail = FeatureThreadDetail(
+            thread: stored.thread,
+            messages: stored.messages,
+            page: stored.page
+        )
+        latestDetails[route.uiID] = detail
+        startDetailStream(
+            route,
+            after: stored.sequence,
+            turnLimit: loadedUserTurnLimit
+        )
+        return detail
     }
 
     func loadThread(id: String) async throws -> FeatureThreadDetail {
@@ -1638,9 +1853,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let supportsPagination = serverConfigsByEnvironmentID[
             environment.id
         ]?.threadSnapshotPagination == true
+        loadedUserTurnLimit = supportsPagination ? Self.initialThreadUserTurnLimit : nil
         let snapshot = try await client.threadSnapshot(
             id: route.wireID,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
+            turnLimit: loadedUserTurnLimit
         )
         guard isKnownClient(client, environmentID: environment.id, generation: generation),
               threadHistoryEpoch == historyEpoch,
@@ -1667,7 +1883,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         startDetailStream(
             route,
             after: snapshot.snapshotSequence,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
+            turnLimit: loadedUserTurnLimit
         )
         return detail
     }
@@ -1742,6 +1958,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         activeRawThread = nil
         activeThreadSequence = nil
         activeThreadPage = nil
+        loadedUserTurnLimit = nil
         threadHistoryEpoch &+= 1
         pendingOlderThreadPage = nil
         markThreadCacheRecentlyUsed(id)
@@ -3250,6 +3467,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 latestDetails[uiThreadID] = nil
                 detailRenderCaches[uiThreadID] = nil
                 detailCacheRecency.removeAll { $0 == uiThreadID }
+                if let environmentID = activeEnvironment?.id {
+                    let store = threadStore
+                    Task.detached(priority: .utility) {
+                        await store.removeThread(
+                            environmentID: environmentID,
+                            threadID: uiThreadID
+                        )
+                    }
+                }
             }
             if activeThreadID == uiThreadID {
                 resetDetailRefresh()
@@ -3259,6 +3485,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 activeRawThread = nil
                 activeThreadSequence = nil
                 activeThreadPage = nil
+                loadedUserTurnLimit = nil
                 threadHistoryEpoch &+= 1
                 pendingOlderThreadPage = nil
             }
@@ -3848,7 +4075,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         ]?.threadSnapshotPagination == true
         let snapshot = try await client.threadSnapshot(
             id: route.wireID,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
+            turnLimit: supportsPagination
+                ? (loadedUserTurnLimit ?? Self.initialThreadUserTurnLimit)
+                : nil
         )
         guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
             throw CancellationError()
@@ -4063,6 +4292,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             // Reducer-provided mutations already updated the authoritative
             // cache. Avoid a prefix comparison across the entire transcript.
             latestDetails[threadID] = detail
+            persist(detail, threadID: threadID, delta: delta)
             if let delta {
                 continuation.yield(.detailDelta(detail, delta))
             } else {
@@ -4089,7 +4319,49 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 }
             }
         }
+        persist(next, threadID: threadID, delta: nil)
         continuation.yield(.detail(next))
+    }
+
+    /// Mirrors every published detail to disk so the next launch can open the
+    /// thread without waiting on the network. A delta writes only the messages
+    /// it touched; anything else is a snapshot and replaces the thread, because
+    /// the server's list is authoritative about removals as well as additions.
+    private func persist(
+        _ detail: FeatureThreadDetail,
+        threadID: String,
+        delta: FeatureDetailDelta?
+    ) {
+        guard let environmentID = detail.thread.environmentID else { return }
+        let isActive = activeThreadID == threadID
+        let sequence = isActive ? (activeThreadSequence ?? 0) : 0
+        let raw = isActive ? activeRawThread : nil
+        let store = threadStore
+        if let delta, !delta.changedMessages.isEmpty {
+            let changed = delta.changedMessages
+            let thread = detail.thread
+            let page = detail.page
+            Task.detached(priority: .utility) {
+                await store.merge(
+                    changedMessages: changed,
+                    thread: thread,
+                    environmentID: environmentID,
+                    sequence: sequence,
+                    page: page,
+                    raw: raw
+                )
+            }
+            return
+        }
+        guard delta == nil else { return }
+        Task.detached(priority: .utility) {
+            await store.replace(
+                detail,
+                environmentID: environmentID,
+                sequence: sequence,
+                raw: raw
+            )
+        }
     }
 
     private func makeDetailDelta(
@@ -4683,6 +4955,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             return latestDetails[route.uiID]
         }
 
+        if let current = loadedUserTurnLimit {
+            loadedUserTurnLimit = current + Self.olderThreadPageUserTurnLimit
+        }
         let mergedThread = mergingOlderHistory(snapshot.thread, into: loadedThread)
         let olderMessages = renderedHistoryMessages(
             snapshot.thread,

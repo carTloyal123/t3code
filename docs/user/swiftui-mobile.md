@@ -7,6 +7,32 @@ by opening the environment's connection details.
 Use **Refresh models** in the model picker for a new or existing task to reload models for the
 selected computer. Other connected computers are not refreshed.
 
+## Thread status
+
+Opening a thread shows what the app is waiting on. **Connecting to <computer>** means the app
+is still reaching that computer, **Loading messages** means it is fetching the conversation, and
+**Up to date** appears briefly once the thread has caught up. **Computer offline** and **Could not
+update thread** both offer a **Retry** action.
+
+Connection is reported before loading, so a slow or unreachable computer names itself instead of
+looking like a slow thread.
+
+## Following a conversation
+
+Threads are kept on the device, so opening one shows its conversation straight away rather than
+waiting on your computer. The app keeps them up to date in the background from the moment it
+launches, and fills in older history as it goes, so scrolling back is usually instant.
+
+Once a thread settles, only its most recent turns stay on the device; scrolling further back
+fetches the rest again. **Settings → Workspace → History** shows how much space conversations are
+using and can clear them. Clearing only removes the copy on your device — nothing is lost, and
+threads download again the next time you open them.
+
+The transcript never scrolls on its own. Replies are added as they arrive and your place stays
+where you left it — scroll down when you want to read them.
+
+Scrolling back loads earlier turns automatically as you reach them, without moving your place.
+
 ## Attachments and sharing
 
 One message can contain up to eight photos, videos, or files. Images can be up to 10 MB. Other

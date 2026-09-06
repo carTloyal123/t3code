@@ -18,7 +18,6 @@ public struct ThreadDetailView: View {
     @State private var selection: FeatureSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
     @State private var isSending = false
-    @State private var isLoading = true
     @State private var sendFailed = false
     @State private var feedbackMessages: [FeatureMessage] = []
     @State private var feedbackRevision: UInt64 = 0
@@ -26,6 +25,30 @@ public struct ThreadDetailView: View {
     @State private var feedbackIdentifier: String?
     @State private var didRestoreDraft = false
     @State private var draftSaveTask: Task<Void, Never>?
+    @State private var showSyncedConfirmation = false
+    @State private var syncedConfirmationTask: Task<Void, Never>?
+
+    /// What the thread has to show right now. Cached content always wins, so
+    /// reopening a thread the model still holds never falls back to a spinner;
+    /// a refresh in flight is reported by the toast instead of replacing what
+    /// is already on screen.
+    private enum Content {
+        case ready(FeatureThreadDetail)
+        case loading
+        case unavailable
+    }
+
+    private var content: Content {
+        if let detail { return .ready(detail) }
+        if case .failed = model.detailLoadStates[thread.id] { return .unavailable }
+        return .loading
+    }
+
+    /// Whether a refresh is in flight. Separate from `content`: a refresh is a
+    /// non-blocking signal, never a reason to hide content.
+    private var isRefreshing: Bool {
+        model.detailLoadStates[thread.id] == .loading
+    }
     @State private var toolSurface: FeatureThreadToolSurface?
     @State private var branchPullRequest: FeaturePullRequest?
     @State private var linkedMediaPreview: FeatureLinkedMediaPreview?
@@ -51,11 +74,15 @@ public struct ThreadDetailView: View {
 
     public var body: some View {
         Group {
-            if let detail {
+            switch content {
+            case let .ready(detail):
                 timeline(detail)
-            } else if isLoading {
-                FeatureThreadOpeningView()
-            } else {
+            case .loading:
+                FeatureThreadOpeningView(
+                    title: refreshPresentation?.title(environmentName: threadEnvironment?.name)
+                        ?? "Loading thread…"
+                )
+            case .unavailable:
                 ContentUnavailableView {
                     Label("Thread unavailable", systemImage: "exclamationmark.bubble")
                 } description: {
@@ -77,13 +104,11 @@ public struct ThreadDetailView: View {
                 threadActionsMenu
             }
         }
+        // Loading is owned by selection in `FeatureRootModel`, not here: this
+        // view is re-hosted while the split view opens, so anything scoped to
+        // its lifetime gets cancelled before it can finish.
         .task(id: thread.id) {
-            let restoreBaseline = composerDraft
-            let restoreKey = draftKey
-            isLoading = true
-            _ = await model.detail(for: thread.id, force: true)
-            isLoading = false
-            await restoreDraft(from: restoreBaseline, key: restoreKey)
+            await restoreDraft(from: composerDraft, key: draftKey)
         }
         .task(id: pullRequestObservationID) {
             await observeThreadPullRequest()
@@ -91,10 +116,13 @@ public struct ThreadDetailView: View {
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
+        .onChange(of: refreshPresentation) { previous, current in
+            trackSyncedConfirmation(from: previous, to: current)
+        }
         .onChange(of: threadConnectionState) { _, state in
             if state == .connected,
                case .failed = model.detailLoadStates[thread.id],
-               !isLoading {
+               !isRefreshing {
                 reloadThread()
             }
         }
@@ -104,7 +132,11 @@ public struct ThreadDetailView: View {
             }
         }
         .onDisappear {
-            model.releaseThread(thread.id)
+            syncedConfirmationTask?.cancel()
+            // Deliberately does not release the thread: a compact
+            // NavigationSplitView re-hosts this view when it opens, and
+            // releasing on that transient disappear tore down the subscription
+            // while the view stayed on screen. Selection owns the lifetime now.
             persistDraftBeforeLeaving()
         }
         .sheet(item: $toolSurface) { surface in
@@ -454,6 +486,13 @@ public struct ThreadDetailView: View {
                     )
                 }
             }
+            Section("Status") {
+                Button {} label: {
+                    Label(refreshMenuStatus.title, systemImage: refreshMenuStatus.systemImage)
+                }
+                .disabled(true)
+                .accessibilityIdentifier("thread-status-item")
+            }
         } label: {
             Image(systemName: "ellipsis")
                 .font(.body.weight(.semibold))
@@ -540,49 +579,113 @@ public struct ThreadDetailView: View {
     }
 
     private func reloadThread() {
-        isLoading = true
         Task {
             _ = await model.detail(for: thread.id, force: true)
-            isLoading = false
         }
     }
 
-    private var threadConnectionState: FeatureConnection.State? {
+    private var threadEnvironment: FeatureEnvironment? {
         guard let environmentID = currentThread.environmentID else { return nil }
-        return model.snapshot.environments.first { $0.id == environmentID }?.connectionState
+        return model.snapshot.environments.first { $0.id == environmentID }
+    }
+
+    private var threadConnectionState: FeatureConnection.State? {
+        threadEnvironment?.connectionState
     }
 
     private var refreshPresentation: ThreadRefreshPresentation? {
         ThreadRefreshPresentation.resolve(
             loadState: model.detailLoadStates[thread.id],
             connectionState: threadConnectionState,
-            isOpening: isLoading
+            isOpening: isRefreshing
+        )
+    }
+
+    /// Shows "Up to date" briefly once a busy thread settles, then clears
+    /// itself. Without it a settled thread and a stalled one look identical.
+    private func trackSyncedConfirmation(
+        from previous: ThreadRefreshPresentation?,
+        to current: ThreadRefreshPresentation?
+    ) {
+        syncedConfirmationTask?.cancel()
+        guard current == nil else {
+            showSyncedConfirmation = false
+            return
+        }
+        guard previous?.isBusy == true else { return }
+        showSyncedConfirmation = true
+        syncedConfirmationTask = Task {
+            try? await Task.sleep(for: .seconds(1.8))
+            guard !Task.isCancelled else { return }
+            showSyncedConfirmation = false
+        }
+    }
+
+    /// Menu-facing status. Unlike the toast this always resolves to something,
+    /// because a menu opened on a settled thread still has to answer whether
+    /// the thread is current.
+    private var refreshMenuStatus: (title: String, systemImage: String) {
+        guard let refreshPresentation else {
+            return ("Up to date", "checkmark.circle")
+        }
+        return (
+            refreshPresentation.title(environmentName: threadEnvironment?.name),
+            refreshPresentation.systemImage
         )
     }
 
     @ViewBuilder
     private var refreshStatus: some View {
         if let refreshPresentation {
-            HStack(spacing: 8) {
-                Label(refreshPresentation.title, systemImage: refreshPresentation.systemImage)
-                    .font(T3Typography.supporting)
-                    .foregroundStyle(T3Colors.textSecondary)
-                Spacer(minLength: 4)
-                if refreshPresentation.canRetry {
-                    Button(action: reloadThread) {
-                        Label("Retry", systemImage: "arrow.clockwise")
-                            .font(T3Typography.control)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(T3Colors.accent)
-                    .frame(minHeight: T3Metrics.minimumTapTarget)
-                    .accessibilityIdentifier("thread-refresh-retry")
-                }
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 8)
-            .accessibilityIdentifier("thread-refresh-status")
+            threadStatusToast(
+                title: refreshPresentation.title(environmentName: threadEnvironment?.name),
+                systemImage: refreshPresentation.systemImage,
+                tint: refreshPresentation.tint,
+                canRetry: refreshPresentation.canRetry
+            )
+        } else if showSyncedConfirmation {
+            threadStatusToast(
+                title: "Up to date",
+                systemImage: "checkmark.circle",
+                tint: T3Colors.success,
+                canRetry: false
+            )
         }
+    }
+
+    private func threadStatusToast(
+        title: String,
+        systemImage: String,
+        tint: Color,
+        canRetry: Bool
+    ) -> some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: systemImage)
+                .font(T3Typography.supportingStrong)
+                .foregroundStyle(tint)
+            if canRetry {
+                Button(action: reloadThread) {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                        .font(T3Typography.control)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(T3Colors.accent)
+                .frame(minHeight: T3Metrics.minimumTapTarget)
+                .accessibilityIdentifier("thread-refresh-retry")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, canRetry ? 0 : 8)
+        .background(Capsule(style: .continuous).fill(T3Colors.surface))
+        .overlay(Capsule(style: .continuous).strokeBorder(T3Colors.border))
+        .shadow(color: T3Colors.shadow, radius: 8, y: 2)
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+        // Floats over the transcript, so it must not swallow taps on the
+        // messages underneath. Only the retry affordance needs hits.
+        .allowsHitTesting(canRetry)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .accessibilityIdentifier("thread-refresh-status")
     }
 
     private var headerBranch: String {
@@ -637,13 +740,21 @@ public struct ThreadDetailView: View {
                     onLoadEarlier: {
                         Task { await model.loadEarlierTurns(for: thread.id) }
                     },
-                    onDismissKeyboard: dismissKeyboard
+                    onDismissKeyboard: dismissKeyboard,
                 )
             }
         }
+        // Each animation stays inside the overlay it belongs to. Attached to
+        // the composed view they also covered the transcript, so a status
+        // change or the button appearing wrapped the collection view's own
+        // scrolling in an implicit animation.
+        .overlay(alignment: .top) {
+            refreshStatus
+                .animation(.easeOut(duration: 0.2), value: refreshPresentation)
+                .animation(.easeOut(duration: 0.2), value: showSyncedConfirmation)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
-                refreshStatus
                 FeatureComposerView(
                     text: $draft,
                     selection: $selection,
@@ -1050,51 +1161,83 @@ public struct ThreadDetailView: View {
 }
 
 enum ThreadRefreshPresentation: Equatable {
-    case loading
+    case connecting
     case reconnecting
+    case loading
     case offline
     case failed
 
-    var title: String {
+    /// Names the computer while reaching it, because "connecting" is only
+    /// actionable when you know which environment is slow.
+    func title(environmentName: String? = nil) -> String {
         switch self {
-        case .loading: "Updating thread..."
-        case .reconnecting: "Reconnecting..."
-        case .offline: "Computer offline"
-        case .failed: "Could not update thread"
+        case .connecting:
+            guard let environmentName, !environmentName.isEmpty else { return "Connecting…" }
+            return "Connecting to \(environmentName)…"
+        case .reconnecting: return "Reconnecting…"
+        case .loading: return "Loading messages…"
+        case .offline: return "Computer offline"
+        case .failed: return "Could not update thread"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .loading: "hourglass"
-        case .reconnecting: "wifi"
+        case .connecting, .reconnecting: "wifi"
+        case .loading: "arrow.triangle.2.circlepath"
         case .offline, .failed: "wifi.exclamationmark"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .connecting, .reconnecting, .loading: T3Colors.textSecondary
+        case .offline: T3Colors.warning
+        case .failed: T3Colors.danger
         }
     }
 
     var canRetry: Bool { self == .offline || self == .failed }
 
+    /// True while the thread is still catching up, so the view knows a later
+    /// settle is worth confirming.
+    var isBusy: Bool {
+        switch self {
+        case .connecting, .reconnecting, .loading: true
+        case .offline, .failed: false
+        }
+    }
+
+    /// Connection is checked before load state: a thread cannot be loading
+    /// from a computer it has not reached yet, and reporting "loading" during
+    /// a slow connect is what made the two indistinguishable.
     static func resolve(
         loadState: FeatureThreadLoadState?,
         connectionState: FeatureConnection.State?,
         isOpening: Bool
     ) -> Self? {
+        switch connectionState {
+        case .connecting: return .connecting
+        case .reconnecting: return .reconnecting
+        case .disconnected: return .offline
+        case .connected, nil: break
+        }
         if isOpening || loadState == .loading { return .loading }
         if case .failed = loadState { return .failed }
-        switch connectionState {
-        case .connecting, .reconnecting: return .reconnecting
-        case .disconnected: return .offline
-        case .connected, nil: return nil
-        }
+        return nil
     }
 }
 
 private struct FeatureThreadOpeningView: View {
+    /// Mirrors the inline toast so a cold open names the same phase the
+    /// settled view would, instead of always claiming to be loading.
+    var title: String = "Loading thread…"
+
     var body: some View {
         VStack(spacing: 12) {
             ProgressView()
                 .controlSize(.regular)
-            Text("Loading thread…")
+            Text(title)
                 .font(T3Typography.supporting)
                 .foregroundStyle(T3Colors.textSecondary)
         }
@@ -1195,15 +1338,51 @@ enum FeatureComposerDraftRestoration {
     }
 }
 
+private enum TranscriptMetrics {
+    /// Gap between two blocks of the same message.
+    static let blockSpacing: CGFloat = 12
+    /// Added by the row that ends a message to reach the gap between messages.
+    static let messageTailSpacing: CGFloat = 10
+}
+
+/// One row of the transcript.
+///
+/// A settled assistant message contributes one row per top-level Markdown
+/// block; everything else is a single row. Self-sizing measures a cell whole
+/// however little of it is on screen, so a message rendered as one cell costs
+/// its full height on open — splitting it makes that cost proportional to the
+/// viewport instead. User turns stay whole because their bubble background
+/// cannot be cut in half, and tool rows collapse to a single line anyway.
+private struct TranscriptItem: Hashable {
+    enum Kind: Hashable {
+        case workingIndicator
+        case loadEarlier
+        case message
+        case segment(index: Int)
+    }
+
+    /// Chrome rows carry their own sentinel id here so change bookkeeping,
+    /// which is keyed by message, applies to them unchanged.
+    let messageID: String
+    let kind: Kind
+    /// Markdown for a `.segment` row. Other kinds render the whole message.
+    let source: String?
+    /// The row that ends a message, and so carries the wider gap to the next.
+    let isMessageTail: Bool
+    let id: String
+
+    /// Identity only: content changes are applied by reconfiguring a row, not
+    /// by replacing it, so they must not show up in the structural diff.
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
 /// A recycled transcript surface. SwiftUI still owns each message's rendering,
 /// while UIKit keeps offscreen messages out of the active view hierarchy.
 private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     private static let workingIndicatorID = "__t3-working-indicator__"
     private static let loadEarlierID = "__t3-load-earlier__"
-
-    private enum Section: Hashable {
-        case transcript
-    }
 
     let threadID: String
     let messages: [FeatureMessage]
@@ -1224,7 +1403,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UICollectionView {
-        let collectionView = BottomAnchoredTranscriptCollectionView(
+        let collectionView = UICollectionView(
             frame: .zero,
             collectionViewLayout: Self.makeLayout()
         )
@@ -1233,8 +1412,14 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         collectionView.keyboardDismissMode = .onDrag
         collectionView.delaysContentTouches = false
         collectionView.contentInsetAdjustmentBehavior = .never
-        collectionView.isPrefetchingEnabled = true
         collectionView.accessibilityIdentifier = "thread-transcript"
+        // The transcript is inverted, so content offset zero *is* the newest
+        // message. Opening a thread needs no scroll at all — the scroll view's
+        // resting position already shows the latest, which is why there is no
+        // scroll-to-bottom anywhere in this file.
+        collectionView.transform = Self.inversion
+        // The indicator would run backwards under the same transform.
+        collectionView.showsVerticalScrollIndicator = false
         context.coordinator.connect(to: collectionView)
         return collectionView
     }
@@ -1258,6 +1443,9 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         )
     }
 
+    /// Flips the collection view; every cell gets it again to read upright.
+    static let inversion = CGAffineTransform(scaleX: 1, y: -1)
+
     private static func makeLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { _, environment in
             let width = environment.container.effectiveContentSize.width
@@ -1272,11 +1460,15 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 subitems: [item]
             )
             let section = NSCollectionLayoutSection(group: group)
-            section.interGroupSpacing = 22
+            // Blocks of one message sit this far apart; the row that ends a
+            // message adds `TranscriptMetrics.messageTailSpacing` on top to
+            // reach the wider gap between messages.
+            section.interGroupSpacing = TranscriptMetrics.blockSpacing
+            // Flipped space: `top` is the visual bottom of the transcript.
             section.contentInsets = NSDirectionalEdgeInsets(
-                top: 18,
+                top: 14,
                 leading: sideInset,
-                bottom: 14,
+                bottom: 18,
                 trailing: sideInset
             )
             return section
@@ -1284,13 +1476,21 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UICollectionViewDataSourcePrefetching, UICollectionViewDelegate {
-        private struct MarkdownPrefetch {
-            let revision: MarkdownContentRevision
-            let task: Task<Void, Never>
-        }
-
-        private var dataSource: UICollectionViewDiffableDataSource<Section, String>?
+    final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDataSourcePrefetching, UICollectionViewDelegate {
+        /// Exactly what the collection view renders, in display order.
+        ///
+        /// Inverted, so newest first: the working indicator leads and the
+        /// load-earlier row trails. Updates are applied as index-path
+        /// operations rather than by diffing a snapshot — we already know what
+        /// changed, and describing it directly costs the number of changes
+        /// instead of the size of the section.
+        private var displayItems: [TranscriptItem] = []
+        /// Block sources per message, kept across updates because deriving them
+        /// hashes the whole message body. Invalidated only for messages the
+        /// update reports as changed.
+        private var segmentsByMessageID: [String: [String]] = [:]
+        private var registration: UICollectionView.CellRegistration<InvertedTranscriptCell, TranscriptItem>?
+        private var markdownPrefetches: [String: Task<Void, Never>] = [:]
         private var messagesByID: [String: FeatureMessage] = [:]
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
@@ -1303,67 +1503,241 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var currentIsMonitoring = false
         private var currentCanLoadEarlier = false
         private var currentIsLoadingEarlier = false
-        private var markdownPrefetches: [String: MarkdownPrefetch] = [:]
         private var onLoadEarlier: (() -> Void)?
         private var onDismissKeyboard: (() -> Void)?
+        private var requestedEarlierBefore: String?
+        /// How close to the top a reader has to be before the next page loads.
+        /// Roughly a screen of headroom, so the read lands before they arrive.
+        private static let earlierTurnsTriggerDistance: CGFloat = 800
 
-        deinit {
-            markdownPrefetches.values.forEach { $0.task.cancel() }
+        /// A cell the reader can see, and where it sits in the viewport.
+        /// Restoring it after a snapshot is what keeps arriving messages from
+        /// moving the transcript, without any reference to `contentSize` —
+        /// which is only ever an estimate while cells are self-sizing.
+        private struct VisibleAnchor {
+            let id: String
+            let offsetFromViewportTop: CGFloat
         }
 
         func connect(to collectionView: UICollectionView) {
-            let registration = UICollectionView.CellRegistration<UICollectionViewCell, String> {
-                [weak self] cell, _, messageID in
-                if messageID == FeatureTranscriptCollectionView.loadEarlierID {
+            let registration = UICollectionView.CellRegistration<InvertedTranscriptCell, TranscriptItem> {
+                [weak self] cell, _, item in
+                cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+                let tailSpacing = item.isMessageTail ? TranscriptMetrics.messageTailSpacing : 0
+
+                switch item.kind {
+                case .loadEarlier:
                     cell.contentConfiguration = UIHostingConfiguration {
                         FeatureLoadEarlierTurnsButton(
                             isLoading: self?.currentIsLoadingEarlier == true,
                             onLoad: { self?.onLoadEarlier?() }
                         )
+                        .padding(.bottom, tailSpacing)
                     }
                     .margins(.all, 0)
-                    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
                     cell.accessibilityIdentifier = "load-earlier-turns"
-                    return
-                }
-                if messageID == FeatureTranscriptCollectionView.workingIndicatorID {
+
+                case .workingIndicator:
                     cell.contentConfiguration = UIHostingConfiguration {
                         FeatureThreadWorkingIndicator(
                             activeSubagentCount: self?.currentActiveSubagentCount ?? 0,
                             backgroundWorkIsActive: self?.currentBackgroundWorkIsActive == true,
                             isMonitoring: self?.currentIsMonitoring == true
                         )
+                        .padding(.bottom, tailSpacing)
                     }
                     .margins(.all, 0)
-                    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
                     cell.accessibilityIdentifier = "thread-working-indicator"
-                    return
-                }
-                guard let message = self?.messagesByID[messageID] else {
-                    cell.contentConfiguration = nil
-                    return
-                }
 
-                cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(message: message, imageContext: self?.currentImageContext)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .message:
+                    guard let message = self?.messagesByID[item.messageID] else {
+                        cell.contentConfiguration = nil
+                        return
+                    }
+                    cell.contentConfiguration = UIHostingConfiguration {
+                        FeatureMessageView(message: message, imageContext: self?.currentImageContext)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.bottom, tailSpacing)
+                    }
+                    .margins(.all, 0)
+                    cell.accessibilityIdentifier = "message-cell-\(item.messageID)"
+
+                case let .segment(index):
+                    guard let message = self?.messagesByID[item.messageID],
+                          let source = item.source else {
+                        cell.contentConfiguration = nil
+                        return
+                    }
+                    cell.contentConfiguration = UIHostingConfiguration {
+                        FeatureAssistantSegmentView(
+                            message: message,
+                            source: source,
+                            isLeading: index == 0,
+                            imageContext: self?.currentImageContext
+                        )
+                        .padding(.bottom, tailSpacing)
+                    }
+                    .margins(.all, 0)
+                    cell.accessibilityIdentifier = "message-cell-\(item.messageID)-\(index)"
                 }
-                .margins(.all, 0)
-                cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
-                cell.accessibilityIdentifier = "message-cell-\(messageID)"
             }
 
-            dataSource = UICollectionViewDiffableDataSource<Section, String>(
-                collectionView: collectionView
-            ) { collectionView, indexPath, messageID in
-                collectionView.dequeueConfiguredReusableCell(
-                    using: registration,
-                    for: indexPath,
-                    item: messageID
-                )
-            }
+            self.registration = registration
+            collectionView.dataSource = self
             collectionView.prefetchDataSource = self
             collectionView.delegate = self
+        }
+
+        /// Parses Markdown for rows about to appear.
+        ///
+        /// Without this the parse happens inside the sizing pass, where UIKit is
+        /// measuring the cell on the main thread — measured at 15–23ms for a
+        /// heavy row, which is two or three dropped frames each time one scrolls
+        /// into view. Warming the cache first turns that into a lookup.
+        func collectionView(
+            _ collectionView: UICollectionView,
+            prefetchItemsAt indexPaths: [IndexPath]
+        ) {
+            for indexPath in indexPaths {
+                guard indexPath.item < displayItems.count else { continue }
+                let item = displayItems[indexPath.item]
+                // A split message warms one block at a time, which is both less
+                // work per row and a smaller unit to reuse while streaming.
+                let text = item.source ?? messagesByID[item.messageID]?.text
+                guard let text, !text.isEmpty, markdownPrefetches[item.id] == nil else {
+                    continue
+                }
+                let revision = MarkdownContentRevision(text)
+                guard MarkdownRenderCache.shared.cachedDocument(for: revision) == nil else {
+                    continue
+                }
+                markdownPrefetches[item.id] = Task { [weak self] in
+                    _ = await MarkdownRenderCache.shared.document(for: revision)
+                    self?.markdownPrefetches[item.id] = nil
+                }
+            }
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            cancelPrefetchingForItemsAt indexPaths: [IndexPath]
+        ) {
+            for indexPath in indexPaths where indexPath.item < displayItems.count {
+                markdownPrefetches.removeValue(forKey: displayItems[indexPath.item].id)?.cancel()
+            }
+        }
+
+        func numberOfSections(in collectionView: UICollectionView) -> Int { 1 }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            numberOfItemsInSection section: Int
+        ) -> Int {
+            displayItems.count
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            cellForItemAt indexPath: IndexPath
+        ) -> UICollectionViewCell {
+            guard let registration, indexPath.item < displayItems.count else {
+                return UICollectionViewCell()
+            }
+            return collectionView.dequeueConfiguredReusableCell(
+                using: registration,
+                for: indexPath,
+                item: displayItems[indexPath.item]
+            )
+        }
+
+        /// Display order for a set of chronological message ids: newest first,
+        /// working indicator leading, load-earlier row trailing.
+        ///
+        /// Rows are built in reading order and reversed once at the end, so a
+        /// split message's blocks come out the right way up inside an inverted
+        /// list without any per-message reasoning about direction.
+        private func makeDisplayItems(
+            messages: [String],
+            isWorking: Bool,
+            canLoadEarlier: Bool
+        ) -> [TranscriptItem] {
+            var reading: [TranscriptItem] = []
+            reading.reserveCapacity(messages.count + 2)
+            for messageID in messages {
+                let segments = segments(for: messageID)
+                guard segments.count > 1 else {
+                    reading.append(
+                        TranscriptItem(
+                            messageID: messageID,
+                            kind: .message,
+                            source: nil,
+                            isMessageTail: true,
+                            id: messageID
+                        )
+                    )
+                    continue
+                }
+                for (index, source) in segments.enumerated() {
+                    reading.append(
+                        TranscriptItem(
+                            messageID: messageID,
+                            kind: .segment(index: index),
+                            source: source,
+                            isMessageTail: index == segments.count - 1,
+                            id: "\(messageID)\u{0}\(index)"
+                        )
+                    )
+                }
+            }
+
+            var display = Array(reading.reversed())
+            if isWorking {
+                display.insert(
+                    TranscriptItem(
+                        messageID: FeatureTranscriptCollectionView.workingIndicatorID,
+                        kind: .workingIndicator,
+                        source: nil,
+                        isMessageTail: true,
+                        id: FeatureTranscriptCollectionView.workingIndicatorID
+                    ),
+                    at: 0
+                )
+            }
+            if canLoadEarlier {
+                display.append(
+                    TranscriptItem(
+                        messageID: FeatureTranscriptCollectionView.loadEarlierID,
+                        kind: .loadEarlier,
+                        source: nil,
+                        isMessageTail: true,
+                        id: FeatureTranscriptCollectionView.loadEarlierID
+                    )
+                )
+            }
+            return display
+        }
+
+        /// Block sources for a message, or an empty list when it renders whole.
+        ///
+        /// Only settled assistant prose splits. A streaming message is rewritten
+        /// several times a second, and re-segmenting it each time would both
+        /// rehash the body and churn the row list under the reader; it becomes
+        /// blocks once it stops moving.
+        private func segments(for messageID: String) -> [String] {
+            if let cached = segmentsByMessageID[messageID] { return cached }
+            guard let message = messagesByID[messageID],
+                  message.role == .assistant,
+                  message.state != .streaming,
+                  !message.text.isEmpty
+            else {
+                segmentsByMessageID[messageID] = []
+                return []
+            }
+            let segments = MarkdownRenderCache.shared.segments(
+                for: MarkdownContentRevision(message.text)
+            )
+            segmentsByMessageID[messageID] = segments
+            return segments
         }
 
         func update(
@@ -1382,7 +1756,6 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             onDismissKeyboard: @escaping () -> Void,
             in collectionView: UICollectionView
         ) {
-            guard let dataSource else { return }
             self.onLoadEarlier = onLoadEarlier
             self.onDismissKeyboard = onDismissKeyboard
 
@@ -1396,8 +1769,17 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 || currentIsMonitoring != isMonitoring
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
-            guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged || workingChanged
-                || workingDetailChanged || loadEarlierChanged else { return }
+            guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged
+                || workingChanged || workingDetailChanged || loadEarlierChanged else { return }
+
+            // Inverted, arriving messages insert ahead of everything on screen,
+            // which shifts a reader part-way up the transcript by the height of
+            // whatever landed. Hold a cell they can actually see and put it back
+            // once the update lands. A different thread is a different list, so
+            // there is nothing to hold across one.
+            let anchor = threadChanged
+                ? nil
+                : visibleAnchor(in: collectionView)
 
             let incremental = !threadChanged
                 ? incrementalState(messages: messages, renderUpdate: renderUpdate)
@@ -1421,156 +1803,92 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             guard threadChanged || idsChanged || !changedIDs.isEmpty || workingChanged
                 || workingDetailChanged || loadEarlierChanged else { return }
 
-            if threadChanged {
-                cancelAllMarkdownPrefetches()
-            } else {
-                var invalidatedIDs = Set(changedIDs)
-                if idsChanged, !state.isAppendOnly {
-                    invalidatedIDs.formUnion(Set(orderedIDs).subtracting(newIDs))
-                }
-                cancelMarkdownPrefetches(for: invalidatedIDs)
-            }
-
-            let wasNearBottom = isNearBottom(collectionView)
-            let lastIDChanged = orderedIDs.last != newIDs.last || workingChanged
-            let isInitialLoad = currentThreadID == nil || threadChanged
-            let previousIDs = orderedIDs
-            let prependedMessages = !threadChanged
-                && newIDs.count > previousIDs.count
-                && Array(newIDs.suffix(previousIDs.count)) == previousIDs
-            let shouldFollowBottom = isInitialLoad || wasNearBottom
-            let prependAnchor = !shouldFollowBottom
-                && (prependedMessages || (loadEarlierChanged && !canLoadEarlier))
-                ? visibleAnchor(in: collectionView, dataSource: dataSource)
-                : nil
-
             currentThreadID = threadID
             if let replacementMessagesByID = state.replacementMessagesByID {
                 messagesByID = replacementMessagesByID
             }
             orderedIDs = newIDs
-            (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor =
-                isInitialLoad || wasNearBottom
 
-            var snapshot: NSDiffableDataSourceSnapshot<Section, String>
-            if threadChanged || loadEarlierChanged {
-                snapshot = NSDiffableDataSourceSnapshot<Section, String>()
-                snapshot.appendSections([.transcript])
-                if canLoadEarlier {
-                    snapshot.appendItems(
-                        [FeatureTranscriptCollectionView.loadEarlierID],
-                        toSection: .transcript
-                    )
-                }
-                snapshot.appendItems(newIDs, toSection: .transcript)
-            } else if !idsChanged {
-                snapshot = dataSource.snapshot()
-            } else if state.isAppendOnly {
-                snapshot = dataSource.snapshot()
-                snapshot.appendItems(state.appendedIDs, toSection: .transcript)
-            } else if newIDs.starts(with: previousIDs) {
-                snapshot = dataSource.snapshot()
-                snapshot.appendItems(Array(newIDs.dropFirst(previousIDs.count)), toSection: .transcript)
-            } else {
-                snapshot = NSDiffableDataSourceSnapshot<Section, String>()
-                snapshot.appendSections([.transcript])
-                if canLoadEarlier {
-                    snapshot.appendItems(
-                        [FeatureTranscriptCollectionView.loadEarlierID],
-                        toSection: .transcript
-                    )
-                }
-                snapshot.appendItems(newIDs, toSection: .transcript)
+            // Extend the existing snapshot when the change is an append, which
+            // is what a streaming turn produces. Rebuilding from scratch makes
+            // every token cost a full diff of the whole transcript.
+            // Inverted display order: newest first, so it renders at the bottom.
+            // A new message therefore inserts at the *front* of the section,
+            // which is why the append fast path checks for a shared suffix
+            // rather than a shared prefix.
+            // Changed bodies re-segment; everything else reuses what it had.
+            for id in changedIDs {
+                segmentsByMessageID[id] = nil
             }
-            if snapshot.indexOfItem(FeatureTranscriptCollectionView.workingIndicatorID) != nil {
-                snapshot.deleteItems([FeatureTranscriptCollectionView.workingIndicatorID])
-            }
-            if isWorking {
-                snapshot.appendItems(
-                    [FeatureTranscriptCollectionView.workingIndicatorID],
-                    toSection: .transcript
-                )
-            }
+            let liveMessageIDs = Set(newIDs)
+            segmentsByMessageID = segmentsByMessageID.filter { liveMessageIDs.contains($0.key) }
+
+            let previousDisplay = displayItems
+            let nextDisplay = makeDisplayItems(
+                messages: newIDs,
+                isWorking: isWorking,
+                canLoadEarlier: canLoadEarlier
+            )
+
+            // Deletions are indexed against the old array and insertions against
+            // the new one, which is what `performBatchUpdates` expects. Rows that
+            // survive must keep their relative order for that to be well
+            // defined; when they do not, reload rather than describe it.
+            let previousSet = Set(previousDisplay)
+            let nextSet = Set(nextDisplay)
+            let deletions = previousDisplay.enumerated()
+                .filter { !nextSet.contains($0.element) }
+                .map { IndexPath(item: $0.offset, section: 0) }
+            let insertions = nextDisplay.enumerated()
+                .filter { !previousSet.contains($0.element) }
+                .map { IndexPath(item: $0.offset, section: 0) }
+            let survivorsKeptOrder = previousDisplay.filter { nextSet.contains($0) }
+                == nextDisplay.filter { previousSet.contains($0) }
+
             let appendedIDSet = Set(state.appendedIDs)
-            var reconfiguredIDs = changedIDs.filter { !appendedIDSet.contains($0) }
-            if loadEarlierChanged,
-               snapshot.indexOfItem(FeatureTranscriptCollectionView.loadEarlierID) != nil {
-                reconfiguredIDs.append(FeatureTranscriptCollectionView.loadEarlierID)
+            var reconfiguredIDs = Set(changedIDs.filter { !appendedIDSet.contains($0) })
+            if loadEarlierChanged {
+                reconfiguredIDs.insert(FeatureTranscriptCollectionView.loadEarlierID)
             }
-            if workingDetailChanged,
-               snapshot.indexOfItem(FeatureTranscriptCollectionView.workingIndicatorID) != nil {
-                reconfiguredIDs.append(FeatureTranscriptCollectionView.workingIndicatorID)
-            }
-            if !reconfiguredIDs.isEmpty {
-                snapshot.reconfigureItems(reconfiguredIDs)
+            if workingDetailChanged {
+                reconfiguredIDs.insert(FeatureTranscriptCollectionView.workingIndicatorID)
             }
 
-            dataSource.apply(snapshot, animatingDifferences: false) {
-                [weak self, weak collectionView] in
-                guard let self, let collectionView else { return }
-                DispatchQueue.main.async {
-                    if shouldFollowBottom {
-                        self.scrollToBottom(
-                            collectionView,
-                            animated: !isInitialLoad && lastIDChanged
-                        )
-                    } else if let prependAnchor {
-                        self.restore(prependAnchor, in: collectionView, dataSource: dataSource)
+            let isFullRebuild = threadChanged || !survivorsKeptOrder
+            let anchorRestore = { [weak self, weak collectionView] in
+                guard let self, let collectionView, let anchor else { return }
+                self.restore(anchor, in: collectionView)
+            }
+
+            if isFullRebuild {
+                displayItems = nextDisplay
+                collectionView.reloadData()
+                collectionView.layoutIfNeeded()
+                anchorRestore()
+            } else {
+                let reconfigured = nextDisplay.enumerated()
+                    .filter {
+                        reconfiguredIDs.contains($0.element.messageID)
+                            && previousSet.contains($0.element)
+                    }
+                    .map { IndexPath(item: $0.offset, section: 0) }
+                UIView.performWithoutAnimation {
+                    collectionView.performBatchUpdates {
+                        displayItems = nextDisplay
+                        if !deletions.isEmpty {
+                            collectionView.deleteItems(at: deletions)
+                        }
+                        if !insertions.isEmpty {
+                            collectionView.insertItems(at: insertions)
+                        }
+                    } completion: { _ in
+                        anchorRestore()
+                    }
+                    if !reconfigured.isEmpty {
+                        collectionView.reconfigureItems(at: reconfigured)
                     }
                 }
             }
-        }
-
-        private struct VisibleAnchor {
-            let id: String
-            let offsetFromViewportTop: CGFloat
-        }
-
-        private func visibleAnchor(
-            in collectionView: UICollectionView,
-            dataSource: UICollectionViewDiffableDataSource<Section, String>
-        ) -> VisibleAnchor? {
-            for indexPath in collectionView.indexPathsForVisibleItems.sorted() {
-                guard let id = dataSource.itemIdentifier(for: indexPath),
-                      id != FeatureTranscriptCollectionView.loadEarlierID,
-                      id != FeatureTranscriptCollectionView.workingIndicatorID,
-                      let attributes = collectionView.layoutAttributesForItem(at: indexPath) else {
-                    continue
-                }
-                return VisibleAnchor(
-                    id: id,
-                    offsetFromViewportTop: attributes.frame.minY - collectionView.contentOffset.y
-                )
-            }
-            return nil
-        }
-
-        private func restore(
-            _ anchor: VisibleAnchor,
-            in collectionView: UICollectionView,
-            dataSource: UICollectionViewDiffableDataSource<Section, String>
-        ) {
-            collectionView.layoutIfNeeded()
-            guard let indexPath = dataSource.indexPath(for: anchor.id),
-                  let attributes = collectionView.layoutAttributesForItem(at: indexPath) else {
-                return
-            }
-            let minimumY = -collectionView.adjustedContentInset.top
-            let maximumY = max(
-                minimumY,
-                collectionView.contentSize.height
-                    - collectionView.bounds.height
-                    + collectionView.adjustedContentInset.bottom
-            )
-            let targetY = min(
-                maximumY,
-                max(minimumY, attributes.frame.minY - anchor.offsetFromViewportTop)
-            )
-            (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = false
-            collectionView.setContentOffset(
-                CGPoint(x: collectionView.contentOffset.x, y: targetY),
-                animated: false
-            )
         }
 
         private struct MessageState {
@@ -1647,109 +1965,93 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             )
         }
 
-        func collectionView(
-            _ collectionView: UICollectionView,
-            prefetchItemsAt indexPaths: [IndexPath]
-        ) {
-            for indexPath in indexPaths where orderedIDs.indices.contains(indexPath.item) {
-                let messageID = orderedIDs[indexPath.item]
-                guard markdownPrefetches[messageID] == nil,
-                      let message = messagesByID[messageID],
-                      !message.text.isEmpty,
-                      message.state != .streaming,
-                      message.role == .user || message.role == .assistant else {
+        /// Older turns load as the reader approaches them. Inverted, older means
+        /// the far end of the content, not the top.
+        ///
+        /// Driven by scroll position rather than by rows being displayed. A page
+        /// of history is inserted *above* the reader, and those rows are laid
+        /// out immediately — so a row-based trigger re-fires on the content it
+        /// just loaded and cascades. Position self-limits instead: the anchor
+        /// restore leaves the reader below the new content, out of range until
+        /// they actually scroll further.
+        private func visibleAnchor(
+            in collectionView: UICollectionView
+        ) -> VisibleAnchor? {
+            // At the newest message there is nothing to hold: the resting offset
+            // is already zero and arriving content grows away from it. Anchoring
+            // anyway is actively wrong — on open only the first row has a real
+            // height, so the anchor latches onto it, and once the reconcile
+            // lands with everything measured that row is thousands of points
+            // down the list and the reader gets dragged back into history.
+            guard collectionView.contentOffset.y > Self.newestOffsetEpsilon else {
+                return nil
+            }
+            for indexPath in collectionView.indexPathsForVisibleItems.sorted() {
+                guard indexPath.item < displayItems.count else { continue }
+                let item = displayItems[indexPath.item]
+                guard item.kind != .loadEarlier,
+                      item.kind != .workingIndicator,
+                      let attributes = collectionView.layoutAttributesForItem(at: indexPath) else {
                     continue
                 }
-
-                let revision = MarkdownContentRevision(message.text)
-                guard MarkdownRenderCache.shared.cachedDocument(for: revision) == nil else {
-                    continue
-                }
-
-                let task = Task { [weak self] in
-                    guard !Task.isCancelled else { return }
-                    _ = await MarkdownRenderCache.shared.document(for: revision)
-                    guard !Task.isCancelled else { return }
-                    self?.finishMarkdownPrefetch(messageID: messageID, revision: revision)
-                }
-                markdownPrefetches[messageID] = MarkdownPrefetch(
-                    revision: revision,
-                    task: task
+                return VisibleAnchor(
+                    id: item.id,
+                    offsetFromViewportTop: attributes.frame.minY - collectionView.contentOffset.y
                 )
             }
+            return nil
         }
 
-        func collectionView(
-            _ collectionView: UICollectionView,
-            cancelPrefetchingForItemsAt indexPaths: [IndexPath]
-        ) {
-            let messageIDs = indexPaths.compactMap { indexPath in
-                orderedIDs.indices.contains(indexPath.item) ? orderedIDs[indexPath.item] : nil
-            }
-            cancelMarkdownPrefetches(for: Set(messageIDs))
-        }
-
-        private func finishMarkdownPrefetch(
-            messageID: String,
-            revision: MarkdownContentRevision
-        ) {
-            guard markdownPrefetches[messageID]?.revision == revision else { return }
-            markdownPrefetches.removeValue(forKey: messageID)
-        }
-
-        private func cancelMarkdownPrefetches(for messageIDs: Set<String>) {
-            for messageID in messageIDs {
-                markdownPrefetches.removeValue(forKey: messageID)?.task.cancel()
-            }
-        }
-
-        private func cancelAllMarkdownPrefetches() {
-            markdownPrefetches.values.forEach { $0.task.cancel() }
-            markdownPrefetches.removeAll(keepingCapacity: true)
-        }
-
-        private func isNearBottom(_ collectionView: UICollectionView) -> Bool {
-            let visibleBottom = collectionView.contentOffset.y
-                + collectionView.bounds.height
-                - collectionView.adjustedContentInset.bottom
-            return collectionView.contentSize.height - visibleBottom < 120
-        }
-
-        private func scrollToBottom(
-            _ collectionView: UICollectionView,
-            animated: Bool
+        private func restore(
+            _ anchor: VisibleAnchor,
+            in collectionView: UICollectionView
         ) {
             collectionView.layoutIfNeeded()
-            let geometry = TranscriptViewportGeometry(
-                contentHeight: collectionView.contentSize.height,
-                viewportHeight: collectionView.bounds.height,
-                topInset: collectionView.adjustedContentInset.top,
-                bottomInset: collectionView.adjustedContentInset.bottom
+            guard let item = displayItems.firstIndex(where: { $0.id == anchor.id }),
+                  let attributes = collectionView.layoutAttributesForItem(
+                      at: IndexPath(item: item, section: 0)
+                  ) else {
+                return
+            }
+            let minimumY = -collectionView.adjustedContentInset.top
+            let maximumY = max(
+                minimumY,
+                collectionView.contentSize.height
+                    - collectionView.bounds.height
+                    + collectionView.adjustedContentInset.bottom
             )
-            let target = CGPoint(x: collectionView.contentOffset.x, y: geometry.bottomOffset)
-            collectionView.setContentOffset(target, animated: animated)
-            (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = true
+            let targetY = min(
+                maximumY,
+                max(minimumY, attributes.frame.minY - anchor.offsetFromViewportTop)
+            )
+            guard abs(collectionView.contentOffset.y - targetY) > 0.5 else { return }
+            collectionView.setContentOffset(
+                CGPoint(x: collectionView.contentOffset.x, y: targetY),
+                animated: false
+            )
+        }
+
+        /// Rounding slack around the resting offset of an inverted transcript.
+        private static let newestOffsetEpsilon: CGFloat = 0.5
+
+        private func requestEarlierTurnsIfNeeded(_ scrollView: UIScrollView) {
+            let distanceFromOldest = scrollView.contentSize.height
+                - scrollView.bounds.height
+                - scrollView.contentOffset.y
+            guard currentCanLoadEarlier,
+                  distanceFromOldest < Self.earlierTurnsTriggerDistance,
+                  let oldest = orderedIDs.first,
+                  requestedEarlierBefore != oldest else { return }
+            requestedEarlierBefore = oldest
+            onLoadEarlier?()
+        }
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            requestEarlierTurnsIfNeeded(scrollView)
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-            (scrollView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = false
             onDismissKeyboard?()
-        }
-
-        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-            guard !decelerate else { return }
-            updateBottomAnchor(for: scrollView)
-        }
-
-        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-            updateBottomAnchor(for: scrollView)
-        }
-
-        private func updateBottomAnchor(for scrollView: UIScrollView) {
-            guard let collectionView = scrollView as? BottomAnchoredTranscriptCollectionView else {
-                return
-            }
-            collectionView.maintainsBottomAnchor = isNearBottom(collectionView)
         }
     }
 }
@@ -1825,37 +2127,27 @@ private struct FeatureThreadWorkingIndicator: View {
     }
 }
 
-struct TranscriptViewportGeometry: Equatable {
-    let contentHeight: CGFloat
-    let viewportHeight: CGFloat
-    let topInset: CGFloat
-    let bottomInset: CGFloat
-
-    var bottomOffset: CGFloat {
-        max(-topInset, contentHeight - viewportHeight + bottomInset)
+/// Reads upright inside the inverted transcript. The flip has to be re-applied
+/// in `apply(_:)`: that assigns `transform` from the cell's layout attributes,
+/// which are identity, so setting it at configuration time leaves the cell
+/// mirrored as soon as it is positioned.
+private final class InvertedTranscriptCell: UICollectionViewCell {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        transform = FeatureTranscriptCollectionView.inversion
     }
 
-    func restoredBottomOffset(
-        after previous: Self?,
-        maintainsBottomAnchor: Bool,
-        isInteracting: Bool
-    ) -> CGFloat? {
-        guard maintainsBottomAnchor, !isInteracting else {
-            return nil
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func apply(_ layoutAttributes: UICollectionViewLayoutAttributes) {
+        super.apply(layoutAttributes)
+        let inversion = FeatureTranscriptCollectionView.inversion
+        if transform != inversion {
+            transform = inversion
         }
-
-        guard let previous,
-              previous.contentHeight > 0,
-              previous.viewportHeight > 0 else {
-            return contentHeight > 0 && viewportHeight > 0 ? bottomOffset : nil
-        }
-
-        let contentChanged = abs(contentHeight - previous.contentHeight) > 0.5
-        let viewportChanged = abs(viewportHeight - previous.viewportHeight) > 0.5
-            || abs(bottomInset - previous.bottomInset) > 0.5
-        guard contentChanged || viewportChanged else { return nil }
-
-        return bottomOffset
     }
 }
 
@@ -2093,41 +2385,6 @@ private struct ThreadBackSwipeGestureView: UIViewRepresentable {
     }
 }
 
-/// Self-sizing hosted Markdown can change the transcript height after a snapshot finishes,
-/// while presenting the keyboard changes the viewport without changing the content at all.
-/// Preserve the visual bottom only while the reader is already following the latest turn.
-private final class BottomAnchoredTranscriptCollectionView: UICollectionView {
-    var maintainsBottomAnchor = false
-
-    private var lastLaidOutGeometry: TranscriptViewportGeometry?
-    private var isRestoringBottomAnchor = false
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-
-        let geometry = TranscriptViewportGeometry(
-            contentHeight: contentSize.height,
-            viewportHeight: bounds.height,
-            topInset: adjustedContentInset.top,
-            bottomInset: adjustedContentInset.bottom
-        )
-        defer { lastLaidOutGeometry = geometry }
-
-        guard let bottomY = geometry.restoredBottomOffset(
-            after: lastLaidOutGeometry,
-            maintainsBottomAnchor: maintainsBottomAnchor,
-            isInteracting: isDragging || isDecelerating || isRestoringBottomAnchor
-        ) else {
-            return
-        }
-        guard abs(contentOffset.y - bottomY) > 0.5 else { return }
-
-        isRestoringBottomAnchor = true
-        contentOffset = CGPoint(x: contentOffset.x, y: bottomY)
-        isRestoringBottomAnchor = false
-    }
-}
-
 private struct FeatureRemoteAttachmentThumbnail: View {
     private struct Request: Hashable {
         let url: URL
@@ -2247,7 +2504,7 @@ private enum FeatureAttachmentThumbnailLoader {
             return cached
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await RemoteImageCache.session.data(from: url)
         try Task.checkCancellation()
         if let response = response as? HTTPURLResponse,
            !(200...299).contains(response.statusCode) {
@@ -2348,12 +2605,7 @@ struct FeatureMessageView: View {
         case .assistant:
             VStack(alignment: .leading, spacing: 10) {
                 if message.state == .streaming {
-                    HStack(spacing: 6) {
-                        Image(systemName: "circle.dotted")
-                        Text("Working")
-                    }
-                    .font(T3Typography.supportingStrong)
-                    .foregroundStyle(T3Colors.statusRunning)
+                    FeatureAssistantStreamingBadge()
                 }
                 FeatureMessageAttachmentsView(attachments: message.attachments)
                 if !message.text.isEmpty {
@@ -2387,6 +2639,51 @@ struct FeatureMessageView: View {
         return [message.text, attachmentSummary]
             .filter { !$0.isEmpty }
             .joined(separator: ", ")
+    }
+}
+
+private struct FeatureAssistantStreamingBadge: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "circle.dotted")
+            Text("Working")
+        }
+        .font(T3Typography.supportingStrong)
+        .foregroundStyle(T3Colors.statusRunning)
+    }
+}
+
+/// One top-level Markdown block of an assistant message.
+///
+/// The leading block also carries what belongs to the message as a whole — the
+/// streaming badge and any attachments — so those stay above the prose without
+/// needing a row of their own. Copying still yields the whole message rather
+/// than the block under the reader's finger.
+private struct FeatureAssistantSegmentView: View {
+    let message: FeatureMessage
+    let source: String
+    let isLeading: Bool
+    let imageContext: MarkdownImageContext?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if isLeading {
+                if message.state == .streaming {
+                    FeatureAssistantStreamingBadge()
+                }
+                FeatureMessageAttachmentsView(attachments: message.attachments)
+            }
+            MarkdownMessageView(
+                source,
+                isStreaming: message.state == .streaming,
+                copySource: message.text,
+                imageContext: imageContext
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("message-\(message.id)")
     }
 }
 
@@ -2472,6 +2769,12 @@ enum FeatureWorkLogMedia {
     }
 }
 
+/// Message bodies render as plain text.
+///
+/// Markdown rendered a SwiftUI view graph per message, which the system cannot
+/// measure or cache the way it can a single `Text` — every transcript update
+/// paid for it. Plain text is a deliberate trade of formatting for a transcript
+/// that stays responsive while an agent is streaming into it.
 private struct FeatureMessageAttachmentsView: View {
     let attachments: [FeatureMessageAttachment]
     @State private var previewedAttachment: FeatureMessageAttachment?

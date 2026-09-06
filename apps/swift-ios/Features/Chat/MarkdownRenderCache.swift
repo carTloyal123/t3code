@@ -168,6 +168,16 @@ final class MarkdownRenderedDocument: @unchecked Sendable {
     }
 }
 
+private final class MarkdownSegmentsBox: NSObject {
+    let revision: MarkdownContentRevision
+    let value: [String]
+
+    init(revision: MarkdownContentRevision, value: [String]) {
+        self.revision = revision
+        self.value = value
+    }
+}
+
 private final class MarkdownRenderedInlineBox: NSObject {
     let value: MarkdownRenderedInline
 
@@ -195,6 +205,7 @@ final class MarkdownRenderCache: @unchecked Sendable {
     }()
 
     private let documents = NSCache<NSString, MarkdownRenderedDocument>()
+    private let segments = NSCache<NSString, MarkdownSegmentsBox>()
     private let inlineRuns = NSCache<NSString, MarkdownRenderedInlineBox>()
     private let inFlightQueue = DispatchQueue(label: "codes.t3.native.markdown-render-cache")
     private struct InFlightRender {
@@ -211,6 +222,8 @@ final class MarkdownRenderCache: @unchecked Sendable {
     ) {
         documents.countLimit = documentCountLimit
         documents.totalCostLimit = documentCostLimit
+        segments.countLimit = documentCountLimit
+        segments.totalCostLimit = documentCostLimit
         inlineRuns.countLimit = inlineCountLimit
         inlineRuns.totalCostLimit = inlineCostLimit
     }
@@ -220,6 +233,27 @@ final class MarkdownRenderCache: @unchecked Sendable {
     /// document's revision equality check below makes collisions safe.
     private func cacheKey(for revision: MarkdownContentRevision) -> NSString {
         "\(revision.fingerprint):\(revision.utf8Count)" as NSString
+    }
+
+    /// Top-level block sources for a message, so the transcript can lay it out
+    /// as one cell per block.
+    ///
+    /// Synchronous by design: the collection view has to know how many items a
+    /// message contributes before it can build a snapshot, and a count that
+    /// arrived later would split rows under the reader. Only block structure is
+    /// parsed here — the expensive inline pass still happens per cell, lazily.
+    func segments(for revision: MarkdownContentRevision) -> [String] {
+        let key = cacheKey(for: revision)
+        if let cached = segments.object(forKey: key), cached.revision == revision {
+            return cached.value
+        }
+        let parsed = MarkdownDocument.segments(parsing: revision.source)
+        segments.setObject(
+            MarkdownSegmentsBox(revision: revision, value: parsed),
+            forKey: key,
+            cost: max(64, revision.utf8Count)
+        )
+        return parsed
     }
 
     func cachedDocument(for revision: MarkdownContentRevision) -> MarkdownRenderedDocument? {
@@ -292,6 +326,7 @@ final class MarkdownRenderCache: @unchecked Sendable {
 
     func removeAll() {
         documents.removeAllObjects()
+        segments.removeAllObjects()
         inlineRuns.removeAllObjects()
         let tasks = inFlightQueue.sync {
             let tasks = inFlight.values.map(\.task)
